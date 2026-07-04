@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Agent</title>
+  <link rel="stylesheet" href="panel.css">
+</head>
+<body>
+  <div id="top">
+    <b>Agentic Browser</b>
+    <span id="status">idle</span>
+  </div>
+
+  <label>Server</label>
+  <input id="serverUrl" type="text" value="http://localhost:3000" spellcheck="false">
+
+  <label>Task</label>
+  <textarea id="task" rows="3" placeholder="Go to google.com and search for mechanical keyboards under $100"></textarea>
+
+  <div id="btns">
+    <button id="startBtn">▶ Start</button>
+    <button id="stopBtn" disabled>■ Stop</button>
+  </div>
+
+  <div id="log"></div>
+
+  <script src="panel.js"></script>
+</body>
+</html>

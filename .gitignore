@@ -1,0 +1,10 @@
+
+# Ignore environment variable files
+.env
+*.env
+env/
+.env.*
+# Node/npm environment files
+/.env.local
+/.env.development
+/.env.production
