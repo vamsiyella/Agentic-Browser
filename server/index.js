@@ -176,6 +176,11 @@ THE BROWSER CHROME (address bar, tab strip) IS NOT A WEBPAGE ELEMENT
 - An in-page search box (Google's search bar, a site's own search field, etc.) IS a normal DOM element — "type" into its element_id, then either "key_press" with key "Enter" or click the search/submit button.
 
 ════════════════════════════════════════════════════════
+DON'T HAND-BUILD DEEP-LINK QUERY STRINGS FOR COMPLEX WEB APPS
+════════════════════════════════════════════════════════
+For JS-heavy sites with their own client-side routing (flight/hotel search tools, maps, dashboards, social feeds), do NOT invent query parameters onto a "navigate" URL and hope the site's frontend interprets them the way you expect (e.g. guessing "?origin=ATL&destination=NYC&departure_date=..." for a flights site). These sites frequently react to unexpected params by auto-redirecting or re-rendering client-side WHILE you are also trying to click something on the page — a race that produces confusing failures ("Element not found") on a page that is not actually broken, just already navigating on its own. Prefer the normal human path instead: navigate only to the site's plain root/search URL, then interact with the real on-page fields (type into the origin/destination boxes, click the actual search button) exactly as a person would. Reserve constructed query strings for cases where you already know the exact schema (e.g. from a URL you observed the site itself produce after a manual search).
+
+════════════════════════════════════════════════════════
 TASK COMPLETION — check this before every action
 ════════════════════════════════════════════════════════
 PATTERN A — repeatable action already satisfied: if RECENT HISTORY shows a successful action matching what the task asked for (e.g. task says "skip song" and history shows a successful click on "Next"), finish now. Don't repeat it just because an identical button is still visible.
@@ -187,7 +192,14 @@ PATTERN C — conditional tasks ("if X do A, else do B"): resolve as soon as eit
 
 PATTERN D — pure tab-management tasks ("open a new tab", "close this tab", "switch to the Wikipedia tab"): satisfied the instant the corresponding tab action succeeds. Nothing further to do on the resulting page unless the task says so.
 
-If the most recent history entry FAILED, do not repeat the identical action — try a different element or approach.
+PATTERN E (search box that jumps straight to a page): many sites skip the results-list step for an exact/near match — submitting a search can navigate DIRECTLY to a specific content page instead of a results list. If URL TRAIL shows you landed on a specific page whose title matches/relates to the query, that already satisfies "search for X and open/click the first result." Only keep clicking if you land on an actual results-LIST page with multiple candidates to choose between.
+
+If the most recent history entry FAILED, do not repeat the identical action — try a different element or approach. See the next section: this is enforced in code, not just advice.
+
+════════════════════════════════════════════════════════
+NEVER REPEAT AN ACTION THAT JUST FAILED, IN THE SAME FORM
+════════════════════════════════════════════════════════
+If RECENT HISTORY shows your last action FAILED (marked with ✗), that exact element_id/target has already been proven not to work THIS INSTANT — the numbered element IDs are reassigned on every observation, so whatever you're looking at now is a fresh list, not the one that failed. Re-emitting the same click/type on what you *assume* is the same button is not a retry, it's a repeat of a disproven guess, and the system will forcibly stop the task after this happens twice in a row with the same target. Instead: re-read the CURRENT interactive elements and DOM snapshot from scratch, check URL TRAIL for whether the page already moved on its own (common on JS-heavy sites — see above), and either pick a genuinely different element, scroll to reveal more options, or navigate/wait if the page still needs to settle.
 
 ════════════════════════════════════════════════════════
 ELEMENT IDs RESET EVERY STEP
@@ -203,11 +215,6 @@ RECENT HISTORY shows what you were thinking on past steps. That's your own prior
 USE THE STEP COUNT — DON'T RE-DO WORK YOU'VE ALREADY DONE
 ════════════════════════════════════════════════════════
 You are told which step you're on out of the max. If you're several steps in, earlier sub-goals ("open a new tab", "navigate to X") are almost certainly already behind you — check URL TRAIL before assuming you still need to do them. A task with N sub-goals should usually finish in roughly N to N+2 steps; if you're well past that, stop and ask: does the CURRENT URL / TITLE already satisfy the task? If yes, finish now instead of taking another action to double-check.
-
-════════════════════════════════════════════════════════
-PATTERN E — a search box that jumps straight to a page (no results list)
-════════════════════════════════════════════════════════
-Many sites (Wikipedia included) skip the results-list step for an exact or near match: submitting a search can navigate DIRECTLY to a specific content page instead of showing a list of results to pick from. If that happens — URL TRAIL shows you landed on a specific article/page, and its title matches or closely relates to the search query — that already satisfies "search for X and open/click the first result." Do not go hunting for more links to click just because the task said "click the first article." Only keep clicking if you land on an actual results-LIST page with multiple candidate links to choose between.
 
 OTHER RULES:
 - Use the screenshot AND the DOM snapshot together before choosing any action.
@@ -297,13 +304,27 @@ What is your next action?${PROVIDER === 'anthropic' ? '' : ' Remember: respond w
     if (PROVIDER === 'anthropic') {
       action = await callAnthropic(userText, screenshot, effectiveTaskId);
     } else {
+      // FIX: NVIDIA's own NIM release notes for the VLM container state
+      // plainly — "Following Meta's guidance, system messages are not
+      // allowed with images." We were sending role:'system' AND an image
+      // in the same request on every single call. The API doesn't error
+      // (so this was invisible in the logs), it just silently mishandles
+      // the combination — which lines up exactly with the symptom: the
+      // model producing plausible-sounding boilerplate ("the user has
+      // already entered the origin and destination cities") that ignores
+      // what's actually in the DOM/screenshot, because the instructions
+      // for HOW to read the page were being dropped or garbled the moment
+      // an image was attached.
+      // Fix: fold the system prompt into the user message as a leading
+      // text block instead of a separate system role. This is the
+      // NVIDIA-documented supported shape for this model, and it's a
+      // request-format fix — zero extra tokens/cost, same free-tier call.
       const messages = [
-        { role: 'system', content: SYSTEM_PROMPT },
         {
           role: 'user',
           content: [
             { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${screenshot}` } },
-            { type: 'text', text: userText },
+            { type: 'text', text: `${SYSTEM_PROMPT}\n\n════════════════════════════════════════════════════════\n\n${userText}` },
           ],
         },
       ];
