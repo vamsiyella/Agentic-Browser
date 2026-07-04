@@ -26,6 +26,35 @@ export class LLMClient {
       .join('\n');
   }
 
+  // NEW: a small, unmissable, deterministic summary of every fillable field
+  // on the page and its CURRENT actual value — pulled straight from the
+  // live DOM, never inferred from vision or guessed.
+  //
+  // WHY THIS EXISTS: on a form-heavy page (flight/hotel search, any search
+  // box, login, checkout) the full INTERACTIVE ELEMENTS list can have
+  // 15-30+ entries, and a small vision-language model reliably loses track
+  // of which specific field has which value buried in there — it will
+  // confidently assert a field "has already been filled in" when it
+  // hasn't, or ignore a stale/autofilled value (e.g. Chrome remembering
+  // "Savannah" in an origin box from a previous session) that directly
+  // contradicts the task. Pulling just the fields into their own short,
+  // labeled block in front of the model makes that mismatch impossible to
+  // miss, instead of relying on it to notice inside a wall of text.
+  _formatFormFields(elementMap) {
+    const FIELD_TAGS = new Set(['input', 'textarea', 'select']);
+    const entries = Object.entries(elementMap).filter(
+      ([, el]) => FIELD_TAGS.has(el.tag) || el.role === 'combobox' || el.role === 'textbox'
+    );
+    if (!entries.length) return null; // no fields on this page — omit the section entirely
+    return entries
+      .map(([id, el]) => {
+        const label = el.ariaLabel || el.placeholder || el.name || `${el.tag} field`;
+        const value = (el.text || '').trim();
+        return `[#${id}] "${label.slice(0, 50)}" = ${value ? `"${value.slice(0, 60)}"` : 'EMPTY'}`;
+      })
+      .join('\n');
+  }
+
   // Format recent action history compactly
   _formatHistory(history) {
     if (!history.length) return 'None — step 1.';
@@ -72,6 +101,7 @@ export class LLMClient {
       task,
       history: this._formatHistory(history),
       elements: this._formatElements(elementMap),
+      formFields: this._formatFormFields(elementMap),
       elementCount: Object.keys(elementMap || {}).length,
       domSnapshot: domSnapshot || '',
       pageText: (pageContext.text || '').slice(0, 1500),
