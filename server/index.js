@@ -48,11 +48,12 @@ if (PROVIDER === 'anthropic' && !ANTHROPIC.apiKey) {
   console.warn('WARNING: ANTHROPIC_API_KEY is not set. Set it in .env');
 }
 
-// ─── Budget guardrails ──────────────────────────────────────────────────────
-// Only meaningful for the paid provider (Anthropic) — NVIDIA's free tier and
-// local Ollama cost $0, so spend tracking is skipped for them entirely.
-// Caps are enforced BEFORE each call, so a runaway task gets stopped rather
-// than discovered after the fact.
+// ─── Budget + usage tracking ────────────────────────────────────────────────
+// Dollar caps only apply to Anthropic (the only paid provider here), but
+// call/token counts are now tracked for EVERY provider — including the free
+// NVIDIA/Ollama paths — because free doesn't mean unlimited: NVIDIA's NIM
+// free tier still enforces its own rate limits, and there was previously no
+// visibility into how close you were to them until a 429 actually happened.
 
 const MAX_COST_PER_TASK_USD = parseFloat(process.env.MAX_COST_PER_TASK_USD || '1.00');
 const DAILY_BUDGET_USD = parseFloat(process.env.DAILY_BUDGET_USD || '10.00');
@@ -65,6 +66,10 @@ const budget = {
   dailySpend: 0,
   dailyResetDate: new Date().toDateString(),
   perTask: new Map(),
+  // NEW: provider-agnostic usage counters.
+  callsToday: 0,
+  tokensToday: 0,
+  callTimestamps: [], // ms epoch timestamps of recent calls, pruned to last 60s
 };
 
 function resetBudgetIfNewDay() {
@@ -73,6 +78,8 @@ function resetBudgetIfNewDay() {
     budget.dailyResetDate = today;
     budget.dailySpend = 0;
     budget.perTask.clear();
+    budget.callsToday = 0;
+    budget.tokensToday = 0;
   }
 }
 
@@ -100,6 +107,25 @@ function recordSpend(taskId, usd) {
   budget.perTask.set(taskId, (budget.perTask.get(taskId) || 0) + usd);
 }
 
+// NEW: call this after EVERY successful LLM call, regardless of provider.
+// Tracks how many calls/tokens have happened today and in the last 60s, so
+// a free-tier rate limit (RPM/RPD) can be seen coming instead of just
+// showing up as a sudden 429.
+function recordCall(tokensIn = 0, tokensOut = 0) {
+  resetBudgetIfNewDay();
+  budget.callsToday += 1;
+  budget.tokensToday += (tokensIn + tokensOut);
+  const now = Date.now();
+  budget.callTimestamps.push(now);
+  budget.callTimestamps = budget.callTimestamps.filter(t => now - t < 60_000);
+}
+
+function callsLastMinute() {
+  const now = Date.now();
+  budget.callTimestamps = budget.callTimestamps.filter(t => now - t < 60_000);
+  return budget.callTimestamps.length;
+}
+
 // ─── Action schema ──────────────────────────────────────────────────────────
 // Shared description used in the prompt for every provider, and as a strict
 // tool schema for Anthropic's native tool-calling.
@@ -107,7 +133,7 @@ function recordSpend(taskId, usd) {
 const ACTION_TYPES = [
   'click', 'type', 'scroll', 'select', 'hover',
   'navigate', 'new_tab', 'switch_tab', 'close_tab', 'go_back', 'go_forward',
-  'wait', 'key_press', 'finish',
+  'wait', 'key_press', 'ask_user', 'finish',
 ];
 
 const ACTION_TOOL = {
@@ -130,7 +156,7 @@ const ACTION_TOOL = {
           type: { type: 'string', enum: ACTION_TYPES },
           element_id: { type: 'string', description: "Required for click/type/select/hover. Must come from THIS step's element list, never a remembered one." },
           text: { type: 'string', description: 'For type actions.' },
-          clear_first: { type: 'boolean' },
+          clear_first: { type: 'boolean', description: 'type clears the field by default; set this to false ONLY to append instead of replace.' },
           direction: { type: 'string', enum: ['up', 'down', 'left', 'right'] },
           amount: { type: 'number' },
           url: { type: 'string', description: 'For navigate or new_tab.' },
@@ -138,6 +164,7 @@ const ACTION_TOOL = {
           key: { type: 'string', description: 'For key_press, e.g. "Enter", "Escape", "Tab".' },
           value: { type: 'string', description: 'For select actions.' },
           ms: { type: 'number', description: 'For wait actions.' },
+          question: { type: 'string', description: 'Required for ask_user — one short, specific question for the human when a genuinely unstated preference blocks progress.' },
           reason: { type: 'string', description: 'Why this action, or why the task is finished.' },
         },
         required: ['type'],
@@ -153,13 +180,13 @@ const SYSTEM_PROMPT =
 `You are an autonomous browser-automation agent controlling a real Chrome browser through a Chrome extension. This is your entire interface to the world:
 - You see a screenshot of the current tab (numbered indigo labels on interactive elements) plus a structured DOM snapshot, page text, and a list of open tabs.
 - You emit exactly ONE action per turn.
-- You have NO filesystem, NO shell, NO code execution — only browser actions: click, type, scroll, select, hover, navigate, new_tab, switch_tab, close_tab, go_back, go_forward, wait, key_press, finish.
+- You have NO filesystem, NO shell, NO code execution — only browser actions: click, type, scroll, select, hover, navigate, new_tab, switch_tab, close_tab, go_back, go_forward, wait, key_press, ask_user, finish.
 
 You operate in a continuous OBSERVE → ORIENT → DECIDE → ACT loop, not a fixed checklist. Simple tasks finish in one action; complex ones take many. Never pad extra actions to match an assumed plan length, and never stop before the task is genuinely satisfied.
 
 OUTPUT FORMAT: ${PROVIDER === 'anthropic'
   ? 'Call the browser_action tool with your decision. Do not respond with plain text.'
-  : 'Output ONLY raw JSON, NO markdown, NO backticks, NO text outside the JSON object: {"game_plan":"...","thought":"...","action":{"type":"...","element_id":"12","text":"...","direction":"down","url":"...","tab_index":0,"key":"Enter","reason":"..."}}. There is no "is_done" field — completion is signaled ONLY by action.type === "finish".'}
+  : 'Output ONLY raw JSON, NO markdown, NO backticks, NO text outside the JSON object: {"game_plan":"...","thought":"...","action":{"type":"...","element_id":"12","text":"...","direction":"down","url":"...","tab_index":0,"key":"Enter","question":"...","reason":"..."}}. There is no "is_done" field — completion is signaled ONLY by action.type === "finish".'}
 
 ════════════════════════════════════════════════════════
 ZERO INTERACTIVE ELEMENTS IS NOT A DEAD END
@@ -179,6 +206,14 @@ THE BROWSER CHROME (address bar, tab strip) IS NOT A WEBPAGE ELEMENT
 DON'T HAND-BUILD DEEP-LINK QUERY STRINGS FOR COMPLEX WEB APPS
 ════════════════════════════════════════════════════════
 For JS-heavy sites with their own client-side routing (flight/hotel search tools, maps, dashboards, social feeds), do NOT invent query parameters onto a "navigate" URL and hope the site's frontend interprets them the way you expect (e.g. guessing "?origin=ATL&destination=NYC&departure_date=..." for a flights site). These sites frequently react to unexpected params by auto-redirecting or re-rendering client-side WHILE you are also trying to click something on the page — a race that produces confusing failures ("Element not found") on a page that is not actually broken, just already navigating on its own. Prefer the normal human path instead: navigate only to the site's plain root/search URL, then interact with the real on-page fields (type into the origin/destination boxes, click the actual search button) exactly as a person would. Reserve constructed query strings for cases where you already know the exact schema (e.g. from a URL you observed the site itself produce after a manual search).
+
+════════════════════════════════════════════════════════
+FIELD STATE CHECK — read before every type/click
+════════════════════════════════════════════════════════
+"type" REPLACES a field's entire content by default (it clears first automatically — you do not need to clear it yourself). Before typing into any field, check the DOM SNAPSHOT's val="..." for that field's CURRENT actual content:
+- If it already shows the value you intend to type, do NOT type again — the field is already correct. Move on to the next step (press Enter / click submit / click the matching suggestion in a dropdown).
+- If RECENT HISTORY already shows a successful "type" on that same field with a matching resultingValue/[FIELD NOW CONTAINS: ...], trust that over your own instinct — don't re-type just because an on-screen dropdown still shows suggestions; that's the field working correctly, not evidence it's empty.
+- Only type again if the CURRENT DOM SNAPSHOT genuinely shows a different or empty value than intended.
 
 ════════════════════════════════════════════════════════
 TASK COMPLETION — check this before every action
@@ -209,12 +244,17 @@ Numbered element IDs in INTERACTIVE ELEMENTS / the DOM snapshot are reassigned f
 ════════════════════════════════════════════════════════
 YOUR OWN PAST REASONING CAN BE STALE — THE URL TRAIL IS GROUND TRUTH
 ════════════════════════════════════════════════════════
-RECENT HISTORY shows what you were thinking on past steps. That's your own prior guess, not a fact — if the page has navigated since then, an old thought like "we're still on the homepage" can be flat-out wrong, and repeating it just reinforces the same mistake. Before writing THOUGHT this turn, check it against URL TRAIL and CURRENT URL below — those are read directly from the browser, computed by code, never guessed. If your instinct disagrees with URL TRAIL, URL TRAIL is right. Each RECENT HISTORY line also shows [NAVIGATED: A → B] when an action actually caused navigation — that bracket is ground truth about what really happened, independent of what you thought would happen.
+RECENT HISTORY shows what you were thinking on past steps. That's your own prior guess, not a fact — if the page has navigated since then, an old thought like "we're still on the homepage" can be flat-out wrong, and repeating it just reinforces the same mistake. Before writing THOUGHT this turn, check it against URL TRAIL and CURRENT URL below — those are read directly from the browser, computed by code, never guessed. If your instinct disagrees with URL TRAIL, URL TRAIL is right. Each RECENT HISTORY line also shows [NAVIGATED: A → B] when an action actually caused navigation, and [FIELD NOW CONTAINS: ...] for the actual post-type value of a field — both are ground truth about what really happened, independent of what you thought would happen.
 
 ════════════════════════════════════════════════════════
 USE THE STEP COUNT — DON'T RE-DO WORK YOU'VE ALREADY DONE
 ════════════════════════════════════════════════════════
 You are told which step you're on out of the max. If you're several steps in, earlier sub-goals ("open a new tab", "navigate to X") are almost certainly already behind you — check URL TRAIL before assuming you still need to do them. A task with N sub-goals should usually finish in roughly N to N+2 steps; if you're well past that, stop and ask: does the CURRENT URL / TITLE already satisfy the task? If yes, finish now instead of taking another action to double-check.
+
+════════════════════════════════════════════════════════
+ASKING THE USER (use sparingly)
+════════════════════════════════════════════════════════
+Use action "ask_user" with a "question" field ONLY when the task is genuinely ambiguous in a way that only the human can resolve — an unstated preference or constraint that isn't on the page and can't be reasonably inferred (e.g. "find me a flight" with no stated max stops, budget, or time window; or a fork where multiple reasonable options diverge and nothing in the task or page breaks the tie). Ask ONE short, specific question. This pauses the whole run until the human answers, so do NOT use it for things you can figure out by reading the page, or for routine choices with an obvious default — guess a sensible default and mention the assumption in your reasoning instead.
 
 OTHER RULES:
 - Use the screenshot AND the DOM snapshot together before choosing any action.
@@ -233,7 +273,11 @@ Correct response: {"game_plan":"Goal: a new tab open showing Wikipedia. Done onc
 EXAMPLE — Pattern A already satisfied:
 TASK: "go to the next song"
 RECENT HISTORY: ✓ click on "Next" → executed OK
-Correct response: {"game_plan":"Goal: skip to the next track. Done when a click on Next/Skip has executed successfully.","thought":"History already shows a successful click on Next. Nothing more to do.","action":{"type":"finish","reason":"Already clicked Next; task complete."}}`;
+Correct response: {"game_plan":"Goal: skip to the next track. Done when a click on Next/Skip has executed successfully.","thought":"History already shows a successful click on Next. Nothing more to do.","action":{"type":"finish","reason":"Already clicked Next; task complete."}}
+
+EXAMPLE — ask_user for a genuinely unstated preference:
+TASK: "find me the cheapest flight"
+Correct response: {"game_plan":"Goal: find the cheapest flight matching the human's constraints. Not yet defined which constraints matter.","thought":"The task doesn't say how many stops are acceptable, which changes what \\"cheapest\\" even means (a 1-stop flight is often much cheaper than nonstop). This isn't inferable from the page — better to ask than guess wrong.","action":{"type":"ask_user","question":"Is a flight with layovers okay, or do you need nonstop only?"}}`;
 
 // ─── Routes ─────────────────────────────────────────────────────────────────
 
@@ -243,10 +287,16 @@ app.get('/api/budget', (req, res) => {
   resetBudgetIfNewDay();
   res.json({
     provider: PROVIDER,
+    model: cfg.model,
+    // Dollar figures are only meaningful for Anthropic — 0 for free providers.
     dailySpendUsd: Number(budget.dailySpend.toFixed(4)),
     dailyBudgetUsd: DAILY_BUDGET_USD,
     maxCostPerTaskUsd: MAX_COST_PER_TASK_USD,
     tasksToday: budget.perTask.size,
+    // NEW: provider-agnostic usage, meaningful for free providers too.
+    callsToday: budget.callsToday,
+    tokensToday: budget.tokensToday,
+    callsLastMinute: callsLastMinute(),
   });
 });
 
@@ -328,7 +378,13 @@ What is your next action?${PROVIDER === 'anthropic' ? '' : ' Remember: respond w
           ],
         },
       ];
-      const raw = await callOpenAICompatible(messages);
+      const { content: raw, usage } = await callOpenAICompatible(messages);
+      recordCall(usage?.prompt_tokens || 0, usage?.completion_tokens || 0);
+      console.log(
+        `[${PROVIDER}] call #${budget.callsToday} today — ` +
+        `${usage?.prompt_tokens || 0} in / ${usage?.completion_tokens || 0} out tokens ` +
+        `(day total: ${budget.tokensToday} tokens, ${callsLastMinute()} calls in last 60s)`
+      );
       action = extractJSON(raw);
     }
 
@@ -361,6 +417,11 @@ async function callOpenAICompatible(messages) {
 
   if (!resp.ok) {
     const text = await resp.text().catch(() => '');
+    // Surface rate-limit responses clearly instead of a generic 500 — free
+    // tiers (NVIDIA NIM included) DO have per-minute/per-day request caps.
+    if (resp.status === 429) {
+      throw new Error(`${PROVIDER} API 429: rate limit hit. ${text.slice(0, 200)}`);
+    }
     throw new Error(`${PROVIDER} API ${resp.status}: ${text.slice(0, 300)}`);
   }
 
@@ -370,7 +431,7 @@ async function callOpenAICompatible(messages) {
     || '';
 
   if (!content) throw new Error('Empty response from model');
-  return content;
+  return { content, usage: data.usage || null };
 }
 
 async function callAnthropic(userText, screenshotB64, taskId) {
@@ -408,9 +469,10 @@ async function callAnthropic(userText, screenshotB64, taskId) {
   const costUsd = ((usage.input_tokens || 0) * ANTHROPIC_INPUT_COST_PER_MTOK +
                     (usage.output_tokens || 0) * ANTHROPIC_OUTPUT_COST_PER_MTOK) / 1_000_000;
   recordSpend(taskId, costUsd);
+  recordCall(usage.input_tokens || 0, usage.output_tokens || 0);
   console.log(
-    `Anthropic call: ${usage.input_tokens || 0} in / ${usage.output_tokens || 0} out → $${costUsd.toFixed(4)}` +
-    ` (task total $${(budget.perTask.get(taskId) || 0).toFixed(4)}, day total $${budget.dailySpend.toFixed(4)})`
+    `[anthropic] call #${budget.callsToday} today — ${usage.input_tokens || 0} in / ${usage.output_tokens || 0} out → $${costUsd.toFixed(4)}` +
+    ` (task total $${(budget.perTask.get(taskId) || 0).toFixed(4)}, day total $${budget.dailySpend.toFixed(4)}, ${callsLastMinute()} calls in last 60s)`
   );
 
   const toolBlock = data.content?.find(b => b.type === 'tool_use');
@@ -443,5 +505,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`Health: http://localhost:${PORT}/health`);
   if (PROVIDER === 'anthropic') {
     console.log(`Budget caps: $${MAX_COST_PER_TASK_USD}/task, $${DAILY_BUDGET_USD}/day (edit server/.env to change)`);
+  } else {
+    console.log(`Usage tracking: calls/tokens logged per request and available at GET /api/budget (no $ cost on ${PROVIDER}).`);
   }
 });

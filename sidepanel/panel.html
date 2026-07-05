@@ -11,6 +11,8 @@
     <span id="status">idle</span>
   </div>
 
+  <div id="usage">·</div>
+
   <label>Server</label>
   <input id="serverUrl" type="text" value="http://localhost:3000" spellcheck="false">
 
@@ -20,6 +22,17 @@
   <div id="btns">
     <button id="startBtn">▶ Start</button>
     <button id="stopBtn" disabled>■ Stop</button>
+  </div>
+
+  <!-- Shown when the agent uses ask_user to pause and ask a clarifying
+       question (e.g. "is a layover okay, or nonstop only?"). Hidden the
+       rest of the time. -->
+  <div id="clarify" class="hidden">
+    <div id="clarifyQuestion"></div>
+    <div id="clarifyRow">
+      <input id="clarifyInput" type="text" placeholder="Type your answer..." spellcheck="false">
+      <button id="clarifySubmit">Answer</button>
+    </div>
   </div>
 
   <div id="log"></div>

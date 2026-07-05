@@ -87,6 +87,18 @@ chrome.runtime.onConnect.addListener(port => {
       broadcastUpdate({ type: 'LOG', level: 'warn', text: 'Task stopped by user.' });
       return;
     }
+
+    // NEW: answer to an ask_user clarifying question. Forwarded straight to
+    // the running loop, which is paused inside AgentLoop._askUser() waiting
+    // on exactly this.
+    if (msg.type === 'USER_ANSWER') {
+      if (loop) {
+        loop.provideUserAnswer(msg.answer);
+      } else {
+        broadcastUpdate({ type: 'LOG', level: 'warn', text: 'Got an answer but no task is running.' });
+      }
+      return;
+    }
   });
 
   port.onDisconnect.addListener(() => {
@@ -96,10 +108,38 @@ chrome.runtime.onConnect.addListener(port => {
   });
 });
 
+// Chrome-devtools-console log level styling, for the mirrored copy below.
+const CONSOLE_STYLE = {
+  error: 'color:#f85149;font-weight:bold',
+  warn: 'color:#d29922',
+  success: 'color:#3fb950;font-weight:bold',
+  action: 'color:#58a6ff',
+  think: 'color:#d2a8ff;font-style:italic',
+  plan: 'color:#7ee787;font-weight:bold',
+  info: 'color:#8b949e',
+};
+
 function broadcastUpdate(msg) {
   // Save to history (cap at 100 items to prevent memory leaks)
   globalLogs.push(msg);
   if (globalLogs.length > 100) globalLogs.shift();
+
+  // NEW: mirror every update to the service worker's own devtools console
+  // (chrome://extensions → "service worker" → Inspect), not just the
+  // sidepanel's 100-item-capped, truncated log. This gives full, searchable,
+  // copy-pasteable visibility into every thought/plan/action/screenshot
+  // event for the whole run, independent of the sidepanel UI.
+  try {
+    if (msg.type === 'LOG') {
+      console.log(`%c[${msg.level}] ${msg.text}`, CONSOLE_STYLE[msg.level] || '');
+    } else if (msg.type === 'SCREENSHOT') {
+      console.log(`[screenshot] ${msg.url}`);
+    } else if (msg.type === 'ASK_USER') {
+      console.log(`%c[ask_user] ${msg.question}`, 'color:#f0883e;font-weight:bold');
+    } else {
+      console.log(`[${msg.type}]`, msg);
+    }
+  } catch { /* never let console mirroring break the actual run */ }
 
   // Send to UI if open
   if (activePort) {

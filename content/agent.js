@@ -429,12 +429,19 @@ function isVisible(el) {
       'svg','path','g','use','defs','br','hr','iframe',
       'video','audio','source','track','picture','map','area',
     ]);
-    const MAX_CHARS = 5000;
+    const MAX_CHARS = 6000;
+    const VIEWPORT_MARGIN = 150; // px of slack above/below the fold, for a little context
     const lines = [];
+    let totalLen = 0; // tracked incrementally — avoids O(n^2) lines.join() on every node
+
+    function push(line) {
+      lines.push(line);
+      totalLen += line.length + 1;
+    }
 
     function walk(el, depth) {
       if (depth > 12) return;
-      if (lines.join('').length > MAX_CHARS) return;
+      if (totalLen > MAX_CHARS) return;
       if (el.nodeType !== 1) return;
 
       const tag = el.tagName.toLowerCase();
@@ -443,22 +450,36 @@ function isVisible(el) {
       const cs = window.getComputedStyle(el);
       if (cs.display === 'none' || cs.visibility === 'hidden') return;
 
+      // FIX: this used to walk the ENTIRE document.body in DOM order with no
+      // regard for scroll position, truncating at MAX_CHARS from the TOP of
+      // the page every single time. On a long page (e.g. a trending-repos
+      // list), that meant the DOM SNAPSHOT TEXT never changed no matter how
+      // far the agent scrolled — only the SCREENSHOT did. The model was
+      // being asked to find something in text it was never actually shown,
+      // which looked like "it can't see the page" but was really "the page
+      // description was frozen at the top regardless of scroll." Skipping
+      // (and not recursing into) anything nowhere near the current viewport
+      // ties the text snapshot to the same content the screenshot shows, so
+      // scrolling actually reveals new text on the next observation.
+      const rect = el.getBoundingClientRect();
+      if (rect.bottom < -VIEWPORT_MARGIN || rect.top > window.innerHeight + VIEWPORT_MARGIN) return;
+
       const pad = '  '.repeat(Math.min(depth, 7));
       const aid = el.getAttribute('data-agent-id');
       const astr = aid ? ` #${aid}` : '';
 
       if (/^h[1-6]$/.test(tag)) {
         const t = el.innerText?.trim().slice(0, 100);
-        if (t) lines.push(`${pad}[${tag.toUpperCase()}] ${t}`);
+        if (t) push(`${pad}[${tag.toUpperCase()}] ${t}`);
 
       } else if (tag === 'a') {
         const t = (el.innerText || el.getAttribute('aria-label') || '').trim().slice(0, 70);
         const h = (el.getAttribute('href') || '').slice(0, 60);
-        if (t || h) lines.push(`${pad}[LINK${astr}] "${t}" → ${h}`);
+        if (t || h) push(`${pad}[LINK${astr}] "${t}" → ${h}`);
 
       } else if (tag === 'button') {
         const t = (el.innerText || el.getAttribute('aria-label') || '').trim().slice(0, 70);
-        lines.push(`${pad}[BUTTON${astr}] "${t}"`);
+        push(`${pad}[BUTTON${astr}] "${t}"`);
 
       } else if (tag === 'input') {
         const type = el.type || 'text';
@@ -469,28 +490,48 @@ function isVisible(el) {
           : (el.value?.slice(0, 50) || '');
         const chk = (type === 'checkbox' || type === 'radio')
           ? ` checked=${el.checked}` : '';
-        lines.push(`${pad}[INPUT:${type}${astr}] label="${label}"${val ? ` val="${val}"` : ''}${chk}`);
+        push(`${pad}[INPUT:${type}${astr}] label="${label}"${val ? ` val="${val}"` : ''}${chk}`);
 
       } else if (tag === 'textarea') {
         const ph = el.placeholder?.slice(0, 40) || '';
         const val = el.value?.slice(0, 60) || '';
-        lines.push(`${pad}[TEXTAREA${astr}] ph="${ph}"${val ? ` val="${val}"` : ''}`);
+        push(`${pad}[TEXTAREA${astr}] ph="${ph}"${val ? ` val="${val}"` : ''}`);
 
       } else if (tag === 'select') {
         const sel = el.options[el.selectedIndex]?.text?.slice(0, 30) || '';
         const opts = Array.from(el.options).slice(0, 6).map(o => o.text?.slice(0, 20)).join(', ');
-        lines.push(`${pad}[SELECT${astr}] sel="${sel}" opts=[${opts}]`);
+        push(`${pad}[SELECT${astr}] sel="${sel}" opts=[${opts}]`);
 
       } else if (tag === 'p') {
         const t = el.innerText?.trim().slice(0, 120);
-        if (t && t.length > 8) lines.push(`${pad}[P] ${t}`);
+        if (t && t.length > 8) push(`${pad}[P] ${t}`);
         return; // don't recurse into p
 
       } else if (['form','nav','main','section','header','footer','article'].includes(tag)) {
         const role = el.getAttribute('role') || '';
         const aria = el.getAttribute('aria-label') || '';
         const info = [role, aria].filter(Boolean).join(' ');
-        lines.push(`${pad}[${tag.toUpperCase()}${info ? ' '+info : ''}]`);
+        push(`${pad}[${tag.toUpperCase()}${info ? ' '+info : ''}]`);
+
+      } else if (tag === 'span' || tag === 'li' || tag === 'div') {
+        // NEW: small inline "badge" text — a GitHub trending repo's
+        // language tag ("Rust"), a star/fork count, a price, a status
+        // pill — was previously INVISIBLE in the text snapshot entirely,
+        // because only headings/links/buttons/inputs/paragraphs got a
+        // line. That left the model no text-based way to find "the repo
+        // written in Rust" and forced it to rely on reading small colored
+        // dots/text in a downscaled JPEG screenshot, which free vision
+        // models are unreliable at. Only DIRECT text nodes are used (not
+        // nested elements' text), so a <li> or <div> wrapping a <a> or
+        // <span> doesn't get its child's text double-counted here — the
+        // child still gets its own line when walk() reaches it below.
+        const directText = Array.from(el.childNodes)
+          .filter(n => n.nodeType === 3)
+          .map(n => n.textContent.trim())
+          .filter(Boolean)
+          .join(' ')
+          .slice(0, 60);
+        if (directText.length > 1) push(`${pad}[${tag.toUpperCase()}${astr}] ${directText}`);
       }
 
       for (const child of el.children) walk(child, depth + 1);

@@ -26,9 +26,9 @@ export class LLMClient {
       .join('\n');
   }
 
-  // NEW: a small, unmissable, deterministic summary of every fillable field
-  // on the page and its CURRENT actual value — pulled straight from the
-  // live DOM, never inferred from vision or guessed.
+  // A small, unmissable, deterministic summary of every fillable field on
+  // the page and its CURRENT actual value — pulled straight from the live
+  // DOM, never inferred from vision or guessed.
   //
   // WHY THIS EXISTS: on a form-heavy page (flight/hotel search, any search
   // box, login, checkout) the full INTERACTIVE ELEMENTS list can have
@@ -55,26 +55,42 @@ export class LLMClient {
       .join('\n');
   }
 
-  // Format recent action history compactly
+  // Format recent action history compactly. This is the model's ONLY memory
+  // of what already happened — everything here should be ground truth
+  // (computed by code from real observations), not the model's own guesses.
   _formatHistory(history) {
     if (!history.length) return 'None — step 1.';
     return history
       .slice(-6)
       .map(h => {
         const ok = h.succeeded === false ? '✗ FAILED' : '✓';
+
+        if (h.action?.type === 'ask_user') {
+          return `${ok} asked_user: "${h.action.question || ''}" → ${h.result}`;
+        }
+
         const what = h.target_label
           ? `${h.action.type} on "${h.target_label}"`
           : JSON.stringify(h.action);
-        // Ground-truth transition, computed from real navigation — not the
-        // model's memory of what it thought would happen.
+
+        // Ground-truth navigation transition, computed from the REAL next
+        // observation — never from what the model predicted would happen.
         let transition = '';
         if (h.resultingUrl !== undefined && h.resultingUrl !== null) {
           transition = h.resultingUrl !== h.url
             ? ` [NAVIGATED: ${h.url} → ${h.resultingUrl}]`
             : ` [same URL, no navigation]`;
         }
+
+        // Ground-truth field value, read directly from the DOM right after
+        // a 'type' action executed — not guessed or re-derived from vision.
+        let fieldState = '';
+        if (h.resultingValue !== undefined && h.resultingValue !== null) {
+          fieldState = ` [FIELD NOW CONTAINS: "${h.resultingValue}"]`;
+        }
+
         const why = h.thought ? ` (was thinking: "${h.thought.slice(0, 90)}")` : '';
-        return `${ok} ${what}${transition} → ${h.result}${why}`;
+        return `${ok} ${what}${transition}${fieldState} → ${h.result}${why}`;
       })
       .join('\n');
   }
@@ -94,7 +110,7 @@ export class LLMClient {
       .join('\n');
   }
 
-  async plan({ taskId, screenshot, elementMap, pageContext, domSnapshot, task, history, navigatedSinceStart, openTabsText, overallPlan, step, maxSteps, urlTrail }) {
+  async plan({ taskId, screenshot, elementMap, pageContext, domSnapshot, task, history, navigatedSinceStart, openTabsText, overallPlan, stepNumber, maxSteps, urlTrail }) {
     const body = {
       taskId,
       screenshot,            // base64 JPEG (no data: prefix)
@@ -112,7 +128,7 @@ export class LLMClient {
       navigatedSinceStart: !!navigatedSinceStart,
       openTabs: openTabsText || '',
       overallPlan: overallPlan || '',
-      step: step || 1,
+      step: stepNumber || 1,
       maxSteps: maxSteps || 30,
       urlTrail: this._formatUrlTrail(urlTrail),
     };

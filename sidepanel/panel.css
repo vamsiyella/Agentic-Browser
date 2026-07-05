@@ -31,6 +31,17 @@ body {
 #status.running { color: #3fb950; border-color: #3fb950; }
 #status.error   { color: #f85149; border-color: #f85149; }
 
+/* NEW: usage/budget readout — shows provider call counts (and $ spend, for
+   paid providers) so a free-tier rate limit doesn't just show up as a
+   surprise 429. */
+#usage {
+  font-size: 10px;
+  color: #6e7681;
+  padding: 2px 0 4px;
+  border-bottom: 1px solid #161b22;
+}
+#usage.warn { color: #d29922; }
+
 label { font-size: 10px; color: #6e7681; }
 
 input, textarea {
@@ -63,6 +74,36 @@ button {
 #stopBtn  { background: #1f0d0d; color: #f85149; border-color: #f85149; }
 #stopBtn:hover { background: #211616; }
 #stopBtn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* NEW: ask_user clarification prompt */
+#clarify {
+  background: #1a1530;
+  border: 1px solid #6e40c9;
+  border-radius: 6px;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+#clarify.hidden { display: none; }
+#clarifyQuestion {
+  color: #d2a8ff;
+  font-style: italic;
+  font-size: 12px;
+}
+#clarifyRow { display: flex; gap: 6px; }
+#clarifyRow input {
+  flex: 1;
+  border-color: #6e40c9;
+}
+#clarifySubmit {
+  flex: 0 0 auto;
+  background: #2d1a52;
+  color: #d2a8ff;
+  border-color: #6e40c9;
+  padding: 5px 10px;
+}
+#clarifySubmit:hover { background: #3a2166; }
 
 #log {
   flex: 1;

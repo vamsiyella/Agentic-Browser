@@ -11,6 +11,21 @@ const POST_ACTION_DELAY_MS = 500;
 const POST_NAV_EXTRA_MS = 800;
 const NEW_TAB_DETECT_DELAY_MS = 350;
 
+// FIX: manifest.json declares content_scripts with all_frames:true (so the
+// agent CAN eventually see inside same-origin iframes). But chrome.tabs.
+// sendMessage(tabId, msg) with no frame targeting broadcasts to EVERY frame
+// in the tab, and Chrome only delivers back ONE arbitrary frame's response
+// — whichever content script happens to call sendResponse first. On pages
+// that embed unrelated cross-origin iframes (e.g. Google's account-switcher
+// widget on flights.google.com, served from ogs.google.com), that iframe's
+// content script can "win" the race and its response — a near-empty,
+// irrelevant page — gets used as if it were the main page. That's what
+// produced the "keeps clicking aimlessly" bug: the agent was intermittently
+// observing a random widget iframe instead of the flight search form.
+// Pinning frameId:0 (always the top-level frame) makes every observation
+// and action target the actual page, deterministically.
+const MAIN_FRAME = { frameId: 0 };
+
 // Actions that don't touch a specific DOM element at all. These MUST still
 // be allowed to run when the current page has zero interactive elements —
 // a pure-text article, a blank tab, a page still loading, or a task that's
@@ -27,13 +42,13 @@ export class AgentLoop {
     this.consecutivePlanFailures = 0;
     this.lastActionSignature = null;
     this.sameActionStreak = 0;
-    // NEW: tracks repeated FAILED actions specifically. consecutiveFailures
-    // (above) increments on ANY failure regardless of cause and only stops
-    // the loop at a generic count of 3 with no useful diagnosis. This pair
-    // instead detects "the model is retrying the exact same doomed action"
-    // — same action type + same target — so we can stop fast with a
-    // specific, actionable message instead of burning the full failure
-    // budget on a guess that was already proven wrong.
+    // Tracks repeated FAILED actions specifically — distinct from
+    // consecutiveFailures below, which increments on ANY failure regardless
+    // of cause and only stops the loop at a generic count of 3 with no
+    // useful diagnosis. This pair instead detects "the model is retrying
+    // the exact same doomed action" (same action type + same target) so we
+    // can stop fast with a specific, actionable message instead of burning
+    // the full failure budget on a guess that was already proven wrong.
     this.lastFailedSignature = null;
     this.sameFailureStreak = 0;
     this.tabId = null;
@@ -47,7 +62,33 @@ export class AgentLoop {
     this.urlTrail = [];
   }
 
-  stop() { this.running = false; }
+  stop() {
+    this.running = false;
+    // If we were paused waiting on a clarifying question, don't leave that
+    // promise dangling forever — resolve it so the loop can unwind cleanly.
+    if (this._pendingAnswerResolve) {
+      this._pendingAnswerResolve(null);
+      this._pendingAnswerResolve = null;
+    }
+  }
+
+  // Pauses the loop and asks the human a question via the sidepanel. The
+  // returned promise resolves once service-worker.js forwards a USER_ANSWER
+  // message (see provideUserAnswer below).
+  _askUser(question) {
+    return new Promise(resolve => {
+      this._pendingAnswerResolve = resolve;
+      this.onUpdate({ type: 'ASK_USER', question });
+    });
+  }
+
+  // Called by service-worker.js when the sidepanel sends a USER_ANSWER.
+  provideUserAnswer(answer) {
+    if (this._pendingAnswerResolve) {
+      this._pendingAnswerResolve(answer);
+      this._pendingAnswerResolve = null;
+    }
+  }
 
   // ─── MAIN LOOP ────────────────────────────────────────────────────────────
 
@@ -149,7 +190,7 @@ export class AgentLoop {
             type: 'UPDATE_UI',
             thought: plan.thought,
             actionText: `Executing: ${plan.action?.type}`,
-          }).catch(() => {});
+          }, MAIN_FRAME).catch(() => {});
 
           this.consecutivePlanFailures = 0;
         } catch (err) {
@@ -183,30 +224,46 @@ export class AgentLoop {
           return;
         }
 
-        // ── EXECUTE ──────────────────────────────────────────────────────
-        // NOTE: targetEl/targetLabel are computed OUTSIDE the try block (and
-        // with `let`, not `const`) because the catch block needs targetLabel
-        // too, to build a failure signature. Previously these were declared
-        // inside the try with `const`, so they were unreachable from catch
-        // and every failure recorded target_label: null — which silently
-        // broke failure-signature tracking (see sameFailureStreak below).
-        const targetEl = plan.action?.element_id != null
-          ? obs.elementMap[String(plan.action.element_id)]
-          : null;
-        // FIX: prefer STABLE identifiers first. `targetEl.text` for an
-        // <input> is derived from its live value (see labelElements() in
-        // content/agent.js), so it changes every time the user types into
-        // it — e.g. "" → "Agentic AI" → "Agentic AIAgentic AI". Using it as
-        // the primary label broke the repeat-action safety net below,
-        // because the signature looked "different" every step even though
-        // the same type-into-the-same-box action was firing over and over.
-        // ariaLabel/placeholder/name don't change when the value does.
-        const targetLabel = targetEl
-          ? (targetEl.ariaLabel || targetEl.placeholder || targetEl.name || targetEl.text || `${targetEl.tag} element`)
-          : (plan.action?.url || plan.action?.key || null);
-        const actionSignature = `${plan.action.type}:${targetLabel || plan.action.element_id || ''}`;
+        // ── ASK USER ─────────────────────────────────────────────────────
+        // Lets the model pause and get a real answer instead of guessing at
+        // an unstated preference (e.g. "how many stops is acceptable?").
+        // This does not count as a step failure/success — it's a genuine
+        // pause. The answer becomes a normal history entry so the next
+        // planning call can act on it.
+        if (plan.action?.type === 'ask_user') {
+          const question = plan.action.question || plan.thought || 'Could you clarify what you want here?';
+          this._log('info', `Asking user: ${question}`);
+          const answer = await this._askUser(question);
+          this._log('info', `User answered: ${answer}`);
+          this.history.push({
+            action: plan.action,
+            target_label: null,
+            thought: plan.thought,
+            result: `User answered: "${answer}"`,
+            succeeded: true,
+            url: obs.pageContext.url,
+          });
+          step--; // this pause didn't consume a real step toward the limit
+          continue;
+        }
 
+        // ── EXECUTE ──────────────────────────────────────────────────────
         try {
+          const targetEl = plan.action?.element_id != null
+            ? obs.elementMap[String(plan.action.element_id)]
+            : null;
+          // FIX: prefer STABLE identifiers first. `targetEl.text` for an
+          // <input> is derived from its live value (see labelElements() in
+          // content/agent.js), so it changes every time the user types into
+          // it — e.g. "" → "Agentic AI" → "Agentic AIAgentic AI". Using it as
+          // the primary label broke the repeat-action safety net below,
+          // because the signature looked "different" every step even though
+          // the same type-into-the-same-box action was firing over and over.
+          // ariaLabel/placeholder/name don't change when the value does.
+          const targetLabel = targetEl
+            ? (targetEl.ariaLabel || targetEl.placeholder || targetEl.name || targetEl.text || `${targetEl.tag} element`)
+            : (plan.action?.url || plan.action?.key || null);
+
           const preScrollHeight = obs.pageContext.scrollHeight;
           // NOTE: this used to be called twice per step (a real bug — every
           // click/type/navigate was firing twice). Call it exactly once.
@@ -245,11 +302,12 @@ export class AgentLoop {
             }
           }
 
-          if (actionSignature === this.lastActionSignature && !isExploratory) {
+          const signature = `${plan.action.type}:${targetLabel || plan.action.element_id || ''}`;
+          if (signature === this.lastActionSignature && !isExploratory) {
             this.sameActionStreak++;
           } else {
             this.sameActionStreak = 1;
-            this.lastActionSignature = actionSignature;
+            this.lastActionSignature = signature;
           }
 
           if (this.sameActionStreak >= 2) {
@@ -259,30 +317,12 @@ export class AgentLoop {
             // re-doing an ineffective action (exactly the bug this session
             // fixed). Message reflects both possibilities honestly instead
             // of asserting success it can't actually confirm.
-            // FIX: 'click' used to be in this list, which meant repeating
-            // ANY click twice — including one totally unrelated to the
-            // task, like re-clicking a filter panel while stuck — got
-            // reported to the user as DONE with a false "task likely
-            // already completed" message. A click only means "probably
-            // done" when it's the specific action the task asked for and
-            // it navigated somewhere; the safety net has no way to check
-            // that here, so click is no longer assumed to mean success.
-            // It now always falls into the "stuck, stopped" branch below,
-            // which is the accurate read for a repeated click that isn't
-            // going anywhere.
-            const likelyDone = ['navigate', 'new_tab', 'go_back', 'go_forward'].includes(plan.action.type);
-            this._log('warn', `Same action repeated ${this.sameActionStreak}x in a row (${actionSignature}). ${likelyDone ? 'Assuming task already complete' : 'This usually means the agent is stuck retrying an ineffective action'} — stopping to avoid an infinite loop.`);
-            // FIX: this used to always send type:'DONE' — including for
-            // the "stuck, not actually done" branch — which the sidepanel
-            // renders with a green "✓ Done:" checkmark. A repeated click
-            // going nowhere is a failure, not a success, and should look
-            // like one in the UI (type:'ERROR'), not be reported as if the
-            // task were accomplished.
-            this.onUpdate(
-              likelyDone
-                ? { type: 'DONE', result: `Repeated "${actionSignature}" ${this.sameActionStreak}x — task likely already completed after the first execution.` }
-                : { type: 'ERROR', message: `Stuck repeating "${actionSignature}" ${this.sameActionStreak}x with no progress — stopped before burning more steps/budget on a stuck loop. Check the last screenshot to see what's blocking progress.` }
-            );
+            const likelyDone = ['navigate', 'new_tab', 'go_back', 'go_forward', 'click'].includes(plan.action.type);
+            this._log('warn', `Same action repeated ${this.sameActionStreak}x in a row (${signature}). ${likelyDone ? 'Assuming task already complete' : 'This usually means the agent is stuck retrying an ineffective action'} — stopping to avoid an infinite loop.`);
+            this.onUpdate({
+              type: 'DONE',
+              result: `Repeated "${signature}" ${this.sameActionStreak}x — ${likelyDone ? 'task likely already completed after the first execution.' : 'stopped before burning more steps/budget on a stuck loop. Check the last screenshot to see what\'s blocking progress.'}`,
+            });
             this.running = false;
             return;
           }
@@ -290,33 +330,32 @@ export class AgentLoop {
           this.consecutiveFailures++;
 
           // ── REPEATED-FAILURE DETECTION ──────────────────────────────
-          // BUG THIS FIXES: previously, if the model kept re-emitting the
-          // *exact same* click/type on an element that doesn't exist (e.g.
-          // an "Explore" button whose element_id was stale because the SPA
-          // re-rendered), each attempt just incremented the generic
-          // consecutiveFailures counter with no memory of WHAT failed. The
-          // model saw only "FAILED: Element #13 not found in DOM" in
-          // history each time and, having no strong reason to change
-          // course, guessed the same element_id again — burning all 3
-          // failure slots on the identical doomed action before the loop
-          // died with a generic, unhelpful "Too many consecutive failures."
-          //
-          // Now we track failures by signature (action type + target) the
-          // same way successful repeats are tracked above, and stop fast
-          // — after 2 identical failures, not 3 generic ones — with a
-          // message that names the actual stuck action instead of a
-          // catch-all error.
-          if (actionSignature === this.lastFailedSignature) {
+          // If the model keeps re-emitting the *exact same* click/type on
+          // a target that just failed (e.g. an element_id that's stale
+          // because the SPA re-rendered, or genuinely doesn't exist), stop
+          // fast — after 2 identical failures, not the generic 3 — with a
+          // message naming the actual stuck action instead of a catch-all.
+          // Uses target_label computed above (stable identifier), same
+          // idea as the success-streak signature.
+          const targetElForFail = plan.action?.element_id != null
+            ? obs.elementMap[String(plan.action.element_id)]
+            : null;
+          const failLabel = targetElForFail
+            ? (targetElForFail.ariaLabel || targetElForFail.placeholder || targetElForFail.name || targetElForFail.text || `${targetElForFail.tag} element`)
+            : (plan.action?.url || plan.action?.key || plan.action?.element_id || null);
+          const failSignature = `${plan.action.type}:${failLabel || ''}`;
+
+          if (failSignature === this.lastFailedSignature) {
             this.sameFailureStreak++;
           } else {
             this.sameFailureStreak = 1;
-            this.lastFailedSignature = actionSignature;
+            this.lastFailedSignature = failSignature;
           }
 
           this._log('error', `Execute failed (${this.consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES}): ${err.message}`);
           this.history.push({
             action: plan.action,
-            target_label: targetLabel,
+            target_label: failLabel,
             thought: plan.thought,
             result: `FAILED: ${err.message}`,
             succeeded: false,
@@ -324,10 +363,10 @@ export class AgentLoop {
           });
 
           if (this.sameFailureStreak >= 2) {
-            this._log('error', `Same action failed identically ${this.sameFailureStreak}x in a row (${actionSignature}) — stopping instead of repeating a guess that's already proven wrong.`);
+            this._log('error', `Same action failed identically ${this.sameFailureStreak}x in a row (${failSignature}) — stopping instead of repeating a guess that's already proven wrong.`);
             this.onUpdate({
               type: 'ERROR',
-              message: `Stuck repeating a failing action: "${actionSignature}" failed ${this.sameFailureStreak}x in a row (${err.message}). The target element likely no longer exists on this page (the page may have re-rendered or auto-navigated). Try rephrasing the task, or check the last screenshot to see the actual current page state.`,
+              message: `Stuck repeating a failing action: "${failSignature}" failed ${this.sameFailureStreak}x in a row (${err.message}). The target element likely no longer exists on this page (the page may have re-rendered or auto-navigated). Try rephrasing the task, or check the last screenshot to see the actual current page state.`,
             });
             this.running = false;
             return;
@@ -358,7 +397,7 @@ export class AgentLoop {
       this._log('error', `Fatal: ${err.message}`);
       this.onUpdate({ type: 'ERROR', message: err.message });
     } finally {
-      try { await chrome.tabs.sendMessage(this.tabId, { type: 'REMOVE_OVERLAY' }); } catch {}
+      try { await chrome.tabs.sendMessage(this.tabId, { type: 'REMOVE_OVERLAY' }, MAIN_FRAME); } catch {}
       this.running = false;
     }
   }
@@ -383,7 +422,7 @@ export class AgentLoop {
         throw err;
       }
       await sleep(400);
-      res = await chrome.tabs.sendMessage(tabId, { type: 'LABEL_ELEMENTS' });
+      res = await chrome.tabs.sendMessage(tabId, { type: 'LABEL_ELEMENTS' }, MAIN_FRAME);
     }
 
     if (!res?.success) {
@@ -392,7 +431,7 @@ export class AgentLoop {
 
     await sleep(80); // let labels paint before the screenshot
     const screenshot = await this._screenshot(tabId);
-    chrome.tabs.sendMessage(tabId, { type: 'REMOVE_OVERLAY' }).catch(() => {});
+    chrome.tabs.sendMessage(tabId, { type: 'REMOVE_OVERLAY' }, MAIN_FRAME).catch(() => {});
     this.lastObservedElements = res.elementMap || {};
     return {
       screenshot,
@@ -449,123 +488,117 @@ export class AgentLoop {
       throw new Error(`Cannot scroll on Element #${action.element_id} because it does not exist.`);
     }
 
-    switch (action.type) {
-      case 'navigate':
-        await chrome.tabs.update(tabId, { url: action.url });
-        await this._waitForNavigation(tabId);
-        return {};
+    try {
+      switch (action.type) {
+        case 'navigate':
+          await chrome.tabs.update(tabId, { url: action.url });
+          await this._waitForNavigation(tabId);
+          return {};
 
-      case 'new_tab': {
-        const newTab = await chrome.tabs.create({ url: action.url || 'about:blank', active: true });
-        this.tabId = newTab.id;
-        if (action.url) await this._waitForNavigation(this.tabId);
-        this._log('info', `Opened a new tab and switched focus to it (tab id ${newTab.id}).`);
-        return { newTabId: newTab.id };
-      }
-
-      case 'switch_tab': {
-        const tabs = await chrome.tabs.query({});
-        const idx = Number(action.tab_index);
-        const target = tabs[idx];
-        if (!target) throw new Error(`No tab at index ${action.tab_index}. There are ${tabs.length} tabs open.`);
-        await chrome.tabs.update(target.id, { active: true });
-        if (target.windowId != null) { try { await chrome.windows.update(target.windowId, { focused: true }); } catch {} }
-        this.tabId = target.id;
-        return { switchedTo: target.id };
-      }
-
-      case 'close_tab': {
-        const tabs = await chrome.tabs.query({});
-        const closeId = action.tab_index != null ? tabs[Number(action.tab_index)]?.id : this.tabId;
-        if (!closeId) throw new Error('No matching tab to close.');
-        const wasCurrent = closeId === this.tabId;
-        await chrome.tabs.remove(closeId);
-        if (wasCurrent) {
-          const remaining = await chrome.tabs.query({ active: true, currentWindow: true });
-          if (remaining[0]) this.tabId = remaining[0].id;
-          else throw new Error('Closed the last open tab — nothing left to act on.');
+        case 'new_tab': {
+          const newTab = await chrome.tabs.create({ url: action.url || 'about:blank', active: true });
+          this.tabId = newTab.id;
+          if (action.url) await this._waitForNavigation(this.tabId);
+          this._log('info', `Opened a new tab and switched focus to it (tab id ${newTab.id}).`);
+          return { newTabId: newTab.id };
         }
-        return { closed: closeId };
-      }
 
-      case 'go_back':
-        await chrome.scripting.executeScript({ target: { tabId: this.tabId }, func: () => history.back() });
-        await this._waitForNavigation(this.tabId);
-        return {};
+        case 'switch_tab': {
+          const tabs = await chrome.tabs.query({});
+          const idx = Number(action.tab_index);
+          const target = tabs[idx];
+          if (!target) throw new Error(`No tab at index ${action.tab_index}. There are ${tabs.length} tabs open.`);
+          await chrome.tabs.update(target.id, { active: true });
+          if (target.windowId != null) { try { await chrome.windows.update(target.windowId, { focused: true }); } catch {} }
+          this.tabId = target.id;
+          return { switchedTo: target.id };
+        }
 
-      case 'go_forward':
-        await chrome.scripting.executeScript({ target: { tabId: this.tabId }, func: () => history.forward() });
-        await this._waitForNavigation(this.tabId);
-        return {};
-
-      case 'wait':
-        await sleep(action.ms || 1000);
-        return {};
-
-      case 'key_press': {
-        const r = await chrome.tabs.sendMessage(tabId, { type: 'EXECUTE_ACTION', action });
-        if (!r?.success) throw new Error(r?.error || 'Content script error');
-        return r.result || {};
-      }
-
-      case 'click': {
-        const tabsBefore = await chrome.tabs.query({});
-        const r = await chrome.tabs.sendMessage(tabId, { type: 'EXECUTE_ACTION', action });
-        if (!r?.success) throw new Error(r?.error || 'Content script error');
-
-        // Detect target="_blank" / window.open() links that spawn a real
-        // new tab outside our control — without this, the loop keeps
-        // observing the now-stale original tab forever.
-        await sleep(NEW_TAB_DETECT_DELAY_MS);
-        const tabsAfter = await chrome.tabs.query({});
-        if (tabsAfter.length > tabsBefore.length) {
-          const known = new Set(tabsBefore.map(t => t.id));
-          const fresh = tabsAfter.find(t => !known.has(t.id));
-          if (fresh) {
-            this._log('info', 'That click opened a new tab — following it.');
-            await chrome.tabs.update(fresh.id, { active: true });
-            this.tabId = fresh.id;
+        case 'close_tab': {
+          const tabs = await chrome.tabs.query({});
+          const closeId = action.tab_index != null ? tabs[Number(action.tab_index)]?.id : this.tabId;
+          if (!closeId) throw new Error('No matching tab to close.');
+          const wasCurrent = closeId === this.tabId;
+          await chrome.tabs.remove(closeId);
+          if (wasCurrent) {
+            const remaining = await chrome.tabs.query({ active: true, currentWindow: true });
+            if (remaining[0]) this.tabId = remaining[0].id;
+            else throw new Error('Closed the last open tab — nothing left to act on.');
           }
+          return { closed: closeId };
         }
-        return r.result || {};
-      }
 
-      case 'type':
-      case 'scroll':
-      case 'select':
-      case 'hover': {
-        const r = await chrome.tabs.sendMessage(tabId, { type: 'EXECUTE_ACTION', action });
-        if (!r?.success) throw new Error(r?.error || 'Content script error');
-        return r.result || {};
-      }
+        case 'go_back':
+          await chrome.scripting.executeScript({ target: { tabId: this.tabId }, func: () => history.back() });
+          await this._waitForNavigation(this.tabId);
+          return {};
 
-      default:
-        throw new Error(`Unknown action: ${action.type}`);
+        case 'go_forward':
+          await chrome.scripting.executeScript({ target: { tabId: this.tabId }, func: () => history.forward() });
+          await this._waitForNavigation(this.tabId);
+          return {};
+
+        case 'wait':
+          await sleep(action.ms || 1000);
+          return {};
+
+        case 'key_press': {
+          const r = await chrome.tabs.sendMessage(tabId, { type: 'EXECUTE_ACTION', action }, MAIN_FRAME);
+          if (!r?.success) throw new Error(r?.error || 'Content script error');
+          return r.result || {};
+        }
+
+        case 'click': {
+          const tabsBefore = await chrome.tabs.query({});
+          const r = await chrome.tabs.sendMessage(tabId, { type: 'EXECUTE_ACTION', action }, MAIN_FRAME);
+          if (!r?.success) throw new Error(r?.error || 'Content script error');
+
+          // Detect target="_blank" / window.open() links that spawn a real
+          // new tab outside our control — without this, the loop keeps
+          // observing the now-stale original tab forever.
+          await sleep(NEW_TAB_DETECT_DELAY_MS);
+          const tabsAfter = await chrome.tabs.query({});
+          if (tabsAfter.length > tabsBefore.length) {
+            const known = new Set(tabsBefore.map(t => t.id));
+            const fresh = tabsAfter.find(t => !known.has(t.id));
+            if (fresh) {
+              this._log('info', 'That click opened a new tab — following it.');
+              await chrome.tabs.update(fresh.id, { active: true });
+              this.tabId = fresh.id;
+            }
+          }
+          return r.result || {};
+        }
+
+        case 'type':
+        case 'scroll':
+        case 'select':
+        case 'hover': {
+          const r = await chrome.tabs.sendMessage(tabId, { type: 'EXECUTE_ACTION', action }, MAIN_FRAME);
+          if (!r?.success) throw new Error(r?.error || 'Content script error');
+          return r.result || {};
+        }
+
+        default:
+          throw new Error(`Unknown action: ${action.type}`);
+      }
+    } catch (err) {
+      // REVERTED: an earlier draft of this merge reintroduced a "force
+      // re-label and retry the same action" fallback here. That's the exact
+      // bug main's history already fixed — this._observe() does a FULL
+      // re-label that reassigns every element_id 1..N from scratch based on
+      // new DOM order, so retrying the SAME stale action object (same
+      // element_id) against a freshly relabeled page can silently act on a
+      // completely different element than intended, or fail for an unrelated
+      // reason. content/agent.js's getElement() already has a safer
+      // same-node CSS-selector fallback that runs BEFORE this ever sees an
+      // error, so a relabel-and-guess-again retry here is redundant on the
+      // good path and actively harmful on the bad path. Let failures
+      // propagate — the repeated-failure detection in run() already forces
+      // a fresh observe+plan cycle with a correct, current element map
+      // instead of a stale guess.
+      throw err;
     }
-    // NOTE: the old code wrapped this entire switch in a try/catch that,
-    // on any "not found" error, called this._observe() (a FULL re-label,
-    // which reassigns every numbered element_id from scratch) and then
-    // retried the SAME action object — including the SAME now-stale
-    // element_id — against the freshly relabeled page.
-    //
-    // That's the root cause of the bug in the report: relabeling doesn't
-    // preserve identity, it just reassigns 1..N in DOM order. If the page
-    // had re-rendered (or was mid-navigation, as Google Flights was after
-    // we hit it with hand-built query params), "element_id 13" after the
-    // retry's relabel could point at a COMPLETELY DIFFERENT element than
-    // before — so the retry either failed again for an unrelated reason,
-    // or worse, silently clicked the wrong thing. It also mutated
-    // `this.lastObservedElements` mid-step without updating the `obs`
-    // object the rest of run() was using, desyncing loop state further.
-    // content/agent.js's own getElement() already has a same-identity
-    // fallback (it retries via the ORIGINAL element's CSS selector before
-    // giving up) — that's the correct place for a same-node retry, and it
-    // already runs before this function ever sees an error. So the extra
-    // relabel-and-guess-again retry here was redundant on the good path
-    // and actively harmful on the bad path. Removed — failures now surface
-    // immediately and are handled by the repeated-failure detection in
-    // run(), which forces a fresh observe+plan cycle with a correct,
-    // current element map instead of a stale guess.
   }
 
   // ─── HELPERS ──────────────────────────────────────────────────────────────
@@ -584,7 +617,7 @@ export class AgentLoop {
   async _trySend(tabId, msg, retries = 2) {
     for (let i = 0; i < retries; i++) {
       try {
-        const r = await chrome.tabs.sendMessage(tabId, msg);
+        const r = await chrome.tabs.sendMessage(tabId, msg, MAIN_FRAME);
         if (r?.success) return r;
       } catch {}
       if (i < retries - 1) await sleep(400);
