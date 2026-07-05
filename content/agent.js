@@ -1,8 +1,10 @@
 // content/agent.js
-// Injected into every page. Three jobs:
+// Injected into every page. Jobs:
 //   1. Label interactive elements with numbered overlays (Set-of-Marks)
 //   2. Build a structured DOM snapshot (accessibility tree-style)
-//   3. Execute actions: click, type, scroll, select, key_press
+//   3. Execute single-element actions: click, type, scroll, select, key_press, hover
+//   4. Execute BULK/DATA actions: extract, expand_all, scroll_to_bottom,
+//      find_images, check_matching, copy-to-clipboard (see DATA_ACTION below)
 
 (function () {
   if (window.__agentBrowserLoaded) return;
@@ -182,7 +184,7 @@ function isVisible(el) {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
-  // ACTION EXECUTION
+  // ACTION EXECUTION (single-element actions)
   // ─────────────────────────────────────────────────────────────────────────
 
 // Pass the elementMap into getElement so it has access to fallback selectors
@@ -418,6 +420,248 @@ function isVisible(el) {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
+  // BULK DATA / UI ACTIONS
+  // These power: bulk extraction & copying, bulk downloads, "expand all"
+  // accordions, infinite scroll, and batch checkbox selection. Each one
+  // operates on the WHOLE page (or whole viewport-scrolled history of it),
+  // not a single labeled element — that's why they're dispatched through a
+  // separate 'DATA_ACTION' message type instead of EXECUTE_ACTION.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  // -- Contact scraper: every email address on the page, from visible text
+  // AND from mailto: links (which often carry addresses not shown as text).
+  function extractEmails() {
+    const bodyText = document.body.innerText || '';
+    const re = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+    const found = new Set((bodyText.match(re) || []).map(s => s.trim()));
+    document.querySelectorAll('a[href^="mailto:"]').forEach((a) => {
+      const addr = a.getAttribute('href').replace(/^mailto:/i, '').split('?')[0].trim();
+      if (addr) found.add(addr);
+    });
+    return Array.from(found);
+  }
+
+  // -- Link harvester: only EXTERNAL links (different hostname), skipping
+  // internal nav/anchors. Returns [url, link text] pairs.
+  function extractExternalLinks() {
+    const origin = window.location.hostname;
+    const links = new Map();
+    document.querySelectorAll('a[href]').forEach((a) => {
+      try {
+        const u = new URL(a.getAttribute('href'), window.location.href);
+        if (!/^https?:$/.test(u.protocol)) return;
+        if (u.hostname && u.hostname !== origin) {
+          const text = (a.innerText || a.getAttribute('aria-label') || '').trim().replace(/\s+/g, ' ').slice(0, 100);
+          if (!links.has(u.href)) links.set(u.href, text);
+        }
+      } catch { /* not a valid URL, skip */ }
+    });
+    return Array.from(links.entries()).map(([url, text]) => [url, text]);
+  }
+
+  // -- Table transcriber: pulls a <table> into clean CSV-ready rows. Uses
+  // action.element_id if given (a cell/row/table the model pointed at),
+  // else picks the largest table on the page (most rows).
+  function extractTable(action) {
+    let table = null;
+    if (action.element_id) {
+      const el = getElement(action);
+      table = el ? (el.closest('table') || el.querySelector('table')) : null;
+    }
+    if (!table) {
+      const tables = Array.from(document.querySelectorAll('table'));
+      tables.sort((a, b) => b.querySelectorAll('tr').length - a.querySelectorAll('tr').length);
+      table = tables[0];
+    }
+    if (!table) throw new Error('No <table> found on this page (or at the given element).');
+
+    const rows = [];
+    table.querySelectorAll('tr').forEach((tr) => {
+      const cells = Array.from(tr.querySelectorAll('th,td')).map((cell) =>
+        (cell.innerText || cell.textContent || '').trim().replace(/\s+/g, ' ')
+      );
+      if (cells.length) rows.push(cells);
+    });
+    if (!rows.length) throw new Error('Table found but it has no readable rows.');
+    return rows;
+  }
+
+  // -- Geospatial/free-text data rip: run a user-provided regex over the
+  // page's visible text and return each match's capture groups as a row.
+  // e.g. pattern with 2 groups (county, fatalities) -> row per match.
+  function extractCustomPattern(patternStr, flagsStr) {
+    if (!patternStr) throw new Error('custom_regex extraction requires a "pattern".');
+    const bodyText = document.body.innerText || '';
+    let re;
+    try {
+      re = new RegExp(patternStr, (flagsStr || 'g').includes('g') ? flagsStr : (flagsStr || '') + 'g');
+    } catch (e) {
+      throw new Error('Invalid regex pattern: ' + e.message);
+    }
+    const rows = [];
+    let m;
+    let guard = 0;
+    while ((m = re.exec(bodyText)) !== null && guard < 5000) {
+      guard++;
+      // Prefer capture groups (row = [group1, group2, ...]); fall back to
+      // the whole match if the pattern has no groups.
+      const row = m.length > 1 ? m.slice(1) : [m[0]];
+      rows.push(row.map((s) => (s == null ? '' : String(s).trim())));
+      if (m.index === re.lastIndex) re.lastIndex++; // avoid infinite loop on zero-width matches
+    }
+    if (!rows.length) throw new Error('Regex matched nothing on this page.');
+    return rows;
+  }
+
+  // -- "Expand All": repeatedly clicks accordions / "Read more" / "Show
+  // more" / aria-expanded=false toggles / closed <details> until none are
+  // left (or a safety cap of passes is hit), so hidden text becomes
+  // readable in the next DOM snapshot / text extraction.
+  async function expandAll(extraPatterns) {
+    const defaultPatterns = [
+      'read more', 'show more', 'view more', 'see more', 'load more',
+      'more details', 'expand', 'continue reading', 'learn more', 'show all',
+    ];
+    const patterns = defaultPatterns.concat(Array.isArray(extraPatterns) ? extraPatterns : []);
+
+    let totalClicked = 0;
+    let pass = 0;
+    let foundOne = true;
+    const MAX_PASSES = 40;
+
+    while (foundOne && pass < MAX_PASSES) {
+      foundOne = false;
+      pass++;
+
+      const candidates = Array.from(document.querySelectorAll(
+        'button, [role="button"], summary, a, [aria-expanded="false"], details:not([open])'
+      ));
+
+      for (const el of candidates) {
+        if (!isVisible(el) && el.tagName.toLowerCase() !== 'details') continue;
+
+        const isClosedDetails = el.tagName.toLowerCase() === 'details' && !el.open;
+        const ariaExpanded = el.getAttribute('aria-expanded');
+        const label = (el.innerText || el.getAttribute('aria-label') || '').trim().toLowerCase();
+        const labelMatches = label.length > 0 && label.length < 40 &&
+          patterns.some((p) => label.includes(p.toLowerCase()));
+
+        if (isClosedDetails || ariaExpanded === 'false' || labelMatches) {
+          try {
+            if (isClosedDetails) {
+              el.open = true;
+            } else {
+              el.scrollIntoView({ block: 'center' });
+              el.click();
+            }
+            totalClicked++;
+            foundOne = true;
+            await sleep(150);
+          } catch { /* keep going even if one toggle fails */ }
+        }
+      }
+    }
+
+    return { clicked: totalClicked, passes: pass };
+  }
+
+  // -- Infinite scroll forcer: scrolls to the bottom N times, waiting for
+  // lazy content to paint each time, and stops early once page height stops
+  // growing for 3 consecutive iterations (nothing left to load).
+  async function scrollToBottomTimes(times) {
+    const n = Math.max(1, Math.min(times || 10, 100));
+    let lastHeight = -1;
+    let stableStreak = 0;
+    let i = 0;
+    for (; i < n; i++) {
+      window.scrollTo({ top: document.body.scrollHeight, behavior: 'auto' });
+      await sleep(700);
+      const h = document.body.scrollHeight;
+      if (h === lastHeight) {
+        stableStreak++;
+        if (stableStreak >= 3) break; // page has genuinely stopped growing
+      } else {
+        stableStreak = 0;
+      }
+      lastHeight = h;
+    }
+    return { iterations: i + 1, finalScrollHeight: document.body.scrollHeight, stoppedEarly: i + 1 < n };
+  }
+
+  // -- "Hi-res only" image finder: returns every <img> meeting a minimum
+  // natural resolution, filtering out obvious UI chrome (logos, icons,
+  // avatars) by alt/class/src hints. Used standalone (find_images) or as
+  // the source list for download_matching_images.
+  function findDownloadableImages(minWidth, minHeight, excludeHints) {
+    const excludes = (Array.isArray(excludeHints) && excludeHints.length)
+      ? excludeHints
+      : ['logo', 'icon', 'avatar', 'profile-pic', 'sprite', 'badge', 'button'];
+    const minW = minWidth || 0;
+    const minH = minHeight || 0;
+
+    const results = [];
+    const seen = new Set();
+    document.querySelectorAll('img').forEach((img) => {
+      const src = img.currentSrc || img.src;
+      if (!src || seen.has(src)) return;
+      const w = img.naturalWidth || img.width || 0;
+      const h = img.naturalHeight || img.height || 0;
+      if (w < minW || h < minH) return;
+      const hint = `${img.alt || ''} ${img.className || ''} ${src}`.toLowerCase();
+      if (excludes.some((e) => e && hint.includes(e.toLowerCase()))) return;
+      seen.add(src);
+      results.push({ src, width: w, height: h, alt: (img.alt || '').trim().slice(0, 80) });
+    });
+    return results;
+  }
+
+  // -- Batch selection for deletion/moderation workflows: checks every
+  // unchecked checkbox whose containing row/list-item/label text contains
+  // the given keyword (case-insensitive). Does NOT click delete itself —
+  // that's a separate, explicit 'click' action so the human/model can
+  // review what got selected first.
+  function checkMatchingRows(keyword) {
+    if (!keyword) throw new Error('check_matching requires a "keyword".');
+    const kw = keyword.toLowerCase();
+    let checked = 0;
+    let inspected = 0;
+    document.querySelectorAll('input[type="checkbox"]:not(:checked):not([disabled])').forEach((cb) => {
+      if (!isVisible(cb)) return;
+      inspected++;
+      const container = cb.closest('tr, li, [role="row"], [role="listitem"]') || cb.closest('label') || cb.parentElement;
+      const text = (container ? (container.innerText || '') : '').toLowerCase();
+      if (text.includes(kw)) {
+        cb.click();
+        checked++;
+      }
+    });
+    return { checked, inspected };
+  }
+
+  // -- Clipboard write with a manual-copy fallback for when the page/frame
+  // doesn't have the focus the async Clipboard API requires.
+  async function copyText(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.top = '-1000px';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      let ok = false;
+      try { ok = document.execCommand('copy'); } catch { ok = false; }
+      ta.remove();
+      if (!ok) throw new Error('Clipboard write failed (page may not have focus).');
+      return true;
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
   // DOM SNAPSHOT  (structured accessibility-tree-style representation)
   // Called AFTER labelElements() so data-agent-id attrs are set.
   // The #N ids here match the numbered labels in the screenshot.
@@ -605,6 +849,55 @@ function isVisible(el) {
               default: throw new Error(`Unknown action type: ${action.type}`);
             }
             sendResponse({ success: true, result });
+            break;
+          }
+
+          // ── BULK DATA / UI ACTIONS ──────────────────────────────────────
+          case 'DATA_ACTION': {
+            const { action } = message;
+            let result;
+            switch (action.type) {
+              case 'extract': {
+                switch (action.extract_mode) {
+                  case 'emails':
+                    result = { rows: extractEmails().map((e) => [e]), kind: 'emails' };
+                    break;
+                  case 'external_links':
+                    result = { rows: extractExternalLinks(), kind: 'external_links' };
+                    break;
+                  case 'table':
+                    result = { rows: extractTable(action), kind: 'table' };
+                    break;
+                  case 'custom_regex':
+                    result = { rows: extractCustomPattern(action.pattern, action.flags), kind: 'custom_regex' };
+                    break;
+                  default:
+                    throw new Error(`Unknown extract_mode: "${action.extract_mode}". Use emails, external_links, table, or custom_regex.`);
+                }
+                break;
+              }
+              case 'expand_all':
+                result = await expandAll(action.match_patterns);
+                break;
+              case 'scroll_to_bottom':
+                result = await scrollToBottomTimes(action.times);
+                break;
+              case 'find_images':
+                result = { images: findDownloadableImages(action.min_width, action.min_height, action.exclude_hints) };
+                break;
+              case 'check_matching':
+                result = checkMatchingRows(action.keyword);
+                break;
+              default:
+                throw new Error(`Unknown data action: ${action.type}`);
+            }
+            sendResponse({ success: true, result });
+            break;
+          }
+
+          case 'COPY_TO_CLIPBOARD': {
+            await copyText(message.text || '');
+            sendResponse({ success: true });
             break;
           }
 

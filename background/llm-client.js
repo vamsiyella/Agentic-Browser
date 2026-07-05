@@ -110,7 +110,11 @@ export class LLMClient {
       .join('\n');
   }
 
-  async plan({ taskId, screenshot, elementMap, pageContext, domSnapshot, task, history, navigatedSinceStart, openTabsText, overallPlan, stepNumber, maxSteps, urlTrail }) {
+  async plan({
+    taskId, screenshot, elementMap, pageContext, domSnapshot, task, history,
+    navigatedSinceStart, openTabsText, overallPlan, stepNumber, maxSteps, urlTrail,
+    dataBufferCount, dataBufferKind,
+  }) {
     const body = {
       taskId,
       screenshot,            // base64 JPEG (no data: prefix)
@@ -131,6 +135,12 @@ export class LLMClient {
       step: stepNumber || 1,
       maxSteps: maxSteps || 30,
       urlTrail: this._formatUrlTrail(urlTrail),
+      // Ground truth on the running bulk-extraction buffer — computed by
+      // the loop from real 'extract' results, not the model's own claims.
+      // Lets the model know whether it's already collected data (and how
+      // much) before deciding to keep paginating vs. export_data/finish.
+      dataBufferCount: dataBufferCount || 0,
+      dataBufferKind: dataBufferKind || null,
     };
 
     const resp = await fetch(`${this.serverUrl}/api/plan`, {

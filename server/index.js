@@ -129,11 +129,25 @@ function callsLastMinute() {
 // ─── Action schema ──────────────────────────────────────────────────────────
 // Shared description used in the prompt for every provider, and as a strict
 // tool schema for Anthropic's native tool-calling.
+//
+// Action families:
+//  - Single-element actions (unchanged): click, type, scroll, select, hover
+//  - Navigation/tab actions (unchanged): navigate, new_tab, switch_tab,
+//    close_tab, go_back, go_forward, wait, key_press
+//  - Control actions (unchanged): ask_user, finish
+//  - NEW bulk data/UI actions: extract, expand_all, scroll_to_bottom,
+//    find_images, check_matching
+//  - NEW buffer/download actions: export_data, copy_clipboard,
+//    download_asset, download_matching_images
 
 const ACTION_TYPES = [
   'click', 'type', 'scroll', 'select', 'hover',
   'navigate', 'new_tab', 'switch_tab', 'close_tab', 'go_back', 'go_forward',
   'wait', 'key_press', 'ask_user', 'finish',
+  // bulk data / UI actions
+  'extract', 'expand_all', 'scroll_to_bottom', 'find_images', 'check_matching',
+  // buffer / download actions
+  'export_data', 'copy_clipboard', 'download_asset', 'download_matching_images',
 ];
 
 const ACTION_TOOL = {
@@ -154,18 +168,53 @@ const ACTION_TOOL = {
         type: 'object',
         properties: {
           type: { type: 'string', enum: ACTION_TYPES },
-          element_id: { type: 'string', description: "Required for click/type/select/hover. Must come from THIS step's element list, never a remembered one." },
+          element_id: { type: 'string', description: "Required for click/type/select/hover. Optional for extract (table mode) to point at a specific table. Must come from THIS step's element list, never a remembered one." },
           text: { type: 'string', description: 'For type actions.' },
           clear_first: { type: 'boolean', description: 'type clears the field by default; set this to false ONLY to append instead of replace.' },
           direction: { type: 'string', enum: ['up', 'down', 'left', 'right'] },
           amount: { type: 'number' },
-          url: { type: 'string', description: 'For navigate or new_tab.' },
+          url: { type: 'string', description: 'For navigate or new_tab. Also required for download_asset (the file URL to download).' },
           tab_index: { type: 'number', description: 'Index into the OPEN TABS list, for switch_tab/close_tab.' },
           key: { type: 'string', description: 'For key_press, e.g. "Enter", "Escape", "Tab".' },
           value: { type: 'string', description: 'For select actions.' },
           ms: { type: 'number', description: 'For wait actions.' },
           question: { type: 'string', description: 'Required for ask_user — one short, specific question for the human when a genuinely unstated preference blocks progress.' },
           reason: { type: 'string', description: 'Why this action, or why the task is finished.' },
+
+          // ── extract ──
+          extract_mode: {
+            type: 'string',
+            enum: ['emails', 'external_links', 'table', 'custom_regex'],
+            description: 'Required for action.type="extract". "emails": every email address on the page (visible text + mailto: links). "external_links": every link to a different domain, as [url, link text] rows — internal nav links are excluded. "table": transcribes the largest (or element_id-targeted) <table> on the page into rows. "custom_regex": runs "pattern" over the page\'s visible text and returns each match\'s capture groups as a row — use this for free-text data rips like "county name and fatality count" out of an unformatted document.',
+          },
+          pattern: { type: 'string', description: 'Regex pattern, required for extract_mode="custom_regex". Use capture groups for each column you want, e.g. "([A-Za-z ]+) County.*?(\\\\d+) (?:killed|fatalit)" to pull (county, fatalities) pairs.' },
+          flags: { type: 'string', description: 'Regex flags for extract_mode="custom_regex", e.g. "gi". "g" is always applied automatically.' },
+
+          // ── expand_all ──
+          match_patterns: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'For expand_all — extra lowercase label substrings to click besides the built-in accordion/"read more"/"show more"/aria-expanded defaults, e.g. ["faq toggle", "+ details"].',
+          },
+
+          // ── scroll_to_bottom ──
+          times: { type: 'number', description: 'For scroll_to_bottom — how many scroll-to-bottom iterations to perform (auto-stops early once page height stops growing for 3 iterations in a row, so it is safe to ask for more than you think you need, e.g. 15).' },
+
+          // ── find_images / download_matching_images ──
+          min_width: { type: 'number', description: 'For find_images/download_matching_images — minimum natural width in pixels (e.g. 1000 for "hi-res only").' },
+          min_height: { type: 'number', description: 'For find_images/download_matching_images — minimum natural height in pixels.' },
+          exclude_hints: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'For find_images/download_matching_images — lowercase substrings checked against each image\'s alt text/class/src that should be EXCLUDED, e.g. ["logo","icon","avatar","profile"] to skip UI chrome and keep only content images like diagrams/charts.',
+          },
+
+          // ── check_matching ──
+          keyword: { type: 'string', description: 'For check_matching — checks every unchecked, visible checkbox whose containing row/list-item/label text contains this keyword (case-insensitive), e.g. "Promo" to select every promotional email before a batch delete. Does not click delete itself — do that as a separate click action afterward so the selection can be sanity-checked first.' },
+
+          // ── export_data / copy_clipboard ──
+          format: { type: 'string', enum: ['csv', 'json'], description: 'For export_data/copy_clipboard — output format of the accumulated extraction buffer. Default csv (clean two-column lists, contact lists, tables, and link harvests all read naturally as CSV).' },
+          filename: { type: 'string', description: 'For export_data — filename to save the export as. For download_asset — filename to save the downloaded file as. Optional; a sensible default is used if omitted.' },
         },
         required: ['type'],
       },
@@ -180,18 +229,18 @@ const SYSTEM_PROMPT =
 `You are an autonomous browser-automation agent controlling a real Chrome browser through a Chrome extension. This is your entire interface to the world:
 - You see a screenshot of the current tab (numbered indigo labels on interactive elements) plus a structured DOM snapshot, page text, and a list of open tabs.
 - You emit exactly ONE action per turn.
-- You have NO filesystem, NO shell, NO code execution — only browser actions: click, type, scroll, select, hover, navigate, new_tab, switch_tab, close_tab, go_back, go_forward, wait, key_press, ask_user, finish.
+- You have NO filesystem, NO shell, NO code execution — only browser actions: click, type, scroll, select, hover, navigate, new_tab, switch_tab, close_tab, go_back, go_forward, wait, key_press, ask_user, finish, extract, expand_all, scroll_to_bottom, find_images, check_matching, export_data, copy_clipboard, download_asset, download_matching_images.
 
 You operate in a continuous OBSERVE → ORIENT → DECIDE → ACT loop, not a fixed checklist. Simple tasks finish in one action; complex ones take many. Never pad extra actions to match an assumed plan length, and never stop before the task is genuinely satisfied.
 
 OUTPUT FORMAT: ${PROVIDER === 'anthropic'
   ? 'Call the browser_action tool with your decision. Do not respond with plain text.'
-  : 'Output ONLY raw JSON, NO markdown, NO backticks, NO text outside the JSON object: {"game_plan":"...","thought":"...","action":{"type":"...","element_id":"12","text":"...","direction":"down","url":"...","tab_index":0,"key":"Enter","question":"...","reason":"..."}}. There is no "is_done" field — completion is signaled ONLY by action.type === "finish".'}
+  : 'Output ONLY raw JSON, NO markdown, NO backticks, NO text outside the JSON object: {"game_plan":"...","thought":"...","action":{"type":"...","element_id":"12","text":"...","direction":"down","url":"...","tab_index":0,"key":"Enter","question":"...","reason":"...","extract_mode":"...","pattern":"...","times":10,"min_width":1000,"exclude_hints":["logo"],"keyword":"...","format":"csv"}}. There is no "is_done" field — completion is signaled ONLY by action.type === "finish".'}
 
 ════════════════════════════════════════════════════════
 ZERO INTERACTIVE ELEMENTS IS NOT A DEAD END
 ════════════════════════════════════════════════════════
-The INTERACTIVE ELEMENTS list can legitimately be empty — long articles, a blank new tab, a page still loading, or a page where nothing in the current viewport happens to be clickable. This does NOT mean you are stuck. Element-free actions work regardless of what's on screen: navigate, new_tab, switch_tab, close_tab, go_back, go_forward, wait, key_press, finish. Read PAGE TEXT and the DOM SNAPSHOT for content, and either scroll to look for controls, or take the element-free action the task actually calls for. NEVER give up just because the element list is empty.
+The INTERACTIVE ELEMENTS list can legitimately be empty — long articles, a blank new tab, a page still loading, or a page where nothing in the current viewport happens to be clickable. This does NOT mean you are stuck. Element-free actions work regardless of what's on screen: navigate, new_tab, switch_tab, close_tab, go_back, go_forward, wait, key_press, finish, extract, expand_all, scroll_to_bottom, find_images. Read PAGE TEXT and the DOM SNAPSHOT for content, and either scroll to look for controls, or take the element-free action the task actually calls for. NEVER give up just because the element list is empty.
 
 ════════════════════════════════════════════════════════
 THE BROWSER CHROME (address bar, tab strip) IS NOT A WEBPAGE ELEMENT
@@ -216,6 +265,39 @@ FIELD STATE CHECK — read before every type/click
 - Only type again if the CURRENT DOM SNAPSHOT genuinely shows a different or empty value than intended.
 
 ════════════════════════════════════════════════════════
+BULK DATA COLLECTION — extract / export_data / copy_clipboard
+════════════════════════════════════════════════════════
+Use "extract" to pull structured data OFF the current page WITHOUT reasoning over it token-by-token yourself — it runs deterministic code in the page and returns clean rows. Every successful extract's rows are automatically appended to a running DATA BUFFER that persists for the rest of the task (you'll see its current size in "DATA BUFFER" below each observation) — you never have to re-state or remember the data yourself, and you don't need to re-extract a page you already extracted.
+- extract_mode="emails" → contact scraping (directories, team pages): every email address on the page.
+- extract_mode="external_links" → link harvesting from a citation-heavy article/wiki page: only links to OTHER domains, skipping internal nav.
+- extract_mode="table" → transcribing a messy HTML <table> (e.g. old government data sites) into clean rows.
+- extract_mode="custom_regex" → free-text data rips (e.g. pulling "county name" + "fatality count" pairs out of an unformatted document): write a regex with one capture group per column you want.
+Once you've collected everything the task asked for, flush the buffer EXACTLY ONCE with:
+- "export_data" (format csv or json) to save it as a downloaded file, or
+- "copy_clipboard" to put it straight on the clipboard (use this when the task says "copy" rather than "download"/"save").
+Then finish. Don't call export_data/copy_clipboard more than once per task unless the task explicitly asks for multiple separate exports.
+
+PAGINATED / CROSS-PAGE SCRAPING PATTERN: for "scrape page 1 through N" or "every result across all pages" tasks: extract → click the actual Next-page control → extract → click Next → ... After each extract, the DATA BUFFER count should have grown; if it doesn't grow after a page you expected new data on, the page likely didn't change (check URL TRAIL) — don't just keep clicking Next blindly. Stop paginating once you've covered the requested page range or Next is no longer present/enabled, then export_data/copy_clipboard once, then finish.
+
+════════════════════════════════════════════════════════
+BULK PAGE MANIPULATION — expand_all / scroll_to_bottom
+════════════════════════════════════════════════════════
+- "expand_all" clicks every collapsed accordion / "Read more" / "Show more" / <details> / aria-expanded="false" control on the page repeatedly until none remain (FAQ pages, docs with collapsed sections). Do this BEFORE extracting or reading page text if the content you need might be hidden behind a toggle.
+- "scroll_to_bottom" (with "times", e.g. 15) forces an infinite-scroll feed to load more content by repeatedly scrolling to the bottom and waiting for lazy content — it auto-stops early once the page stops growing, so it's safe to ask for more iterations than you think you'll need. Use this before extract/find_images/download_matching_images on feeds, image boards, or any page that lazy-loads on scroll.
+
+════════════════════════════════════════════════════════
+BULK IMAGE / FILE DOWNLOADS — find_images / download_matching_images / download_asset
+════════════════════════════════════════════════════════
+- "find_images" (min_width, min_height, exclude_hints) previews which images on the page meet a size/content filter, without downloading anything — use it first if you want to sanity-check the filter before committing to a bulk download.
+- "download_matching_images" (min_width, min_height, exclude_hints) re-runs that same filter and downloads every match via the browser's downloads. Use min_width/min_height for "hi-res only" requests (e.g. 1000/1000), and exclude_hints for "ignore logos/icons/avatars" style requests (default excludes already skip common UI chrome like logo/icon/avatar/sprite/badge/button — add more terms specific to the page if needed, e.g. "thumbnail" for a gallery that also shows small preview crops).
+- "download_asset" (url, optional filename) downloads one specific file by direct URL — e.g. a PDF link you found via extract_mode="external_links" or by reading the DOM snapshot. For "download the first 20 search results' PDFs", plan on repeating: read/click to the item's PDF link → download_asset with that url → back to results → next item.
+
+════════════════════════════════════════════════════════
+BATCH SELECTION / DELETION — check_matching
+════════════════════════════════════════════════════════
+"check_matching" (keyword) checks every unchecked, visible checkbox whose row/list-item/label text contains the keyword — e.g. keyword "Promo" to select every promotional email in an inbox before deleting. It does NOT click delete for you: after check_matching, look at the resulting screenshot/DOM to confirm the right items got checked, THEN issue a separate "click" on the actual delete/trash button.
+
+════════════════════════════════════════════════════════
 TASK COMPLETION — check this before every action
 ════════════════════════════════════════════════════════
 PATTERN A — repeatable action already satisfied: if RECENT HISTORY shows a successful action matching what the task asked for (e.g. task says "skip song" and history shows a successful click on "Next"), finish now. Don't repeat it just because an identical button is still visible.
@@ -228,6 +310,8 @@ PATTERN C — conditional tasks ("if X do A, else do B"): resolve as soon as eit
 PATTERN D — pure tab-management tasks ("open a new tab", "close this tab", "switch to the Wikipedia tab"): satisfied the instant the corresponding tab action succeeds. Nothing further to do on the resulting page unless the task says so.
 
 PATTERN E (search box that jumps straight to a page): many sites skip the results-list step for an exact/near match — submitting a search can navigate DIRECTLY to a specific content page instead of a results list. If URL TRAIL shows you landed on a specific page whose title matches/relates to the query, that already satisfies "search for X and open/click the first result." Only keep clicking if you land on an actual results-LIST page with multiple candidates to choose between.
+
+PATTERN F — bulk extraction/download/pagination tasks: these are done once (a) the DATA BUFFER holds everything the task asked for AND you've called export_data/copy_clipboard exactly once, OR (b) for pure download tasks, download_matching_images/download_asset has run for every matching item/page the task specified. Don't finish a "copy/export/download all X" task without actually calling export_data, copy_clipboard, download_asset, or download_matching_images at least once — collecting into the buffer or previewing with find_images is not itself the deliverable.
 
 If the most recent history entry FAILED, do not repeat the identical action — try a different element or approach. See the next section: this is enforced in code, not just advice.
 
@@ -277,7 +361,14 @@ Correct response: {"game_plan":"Goal: skip to the next track. Done when a click 
 
 EXAMPLE — ask_user for a genuinely unstated preference:
 TASK: "find me the cheapest flight"
-Correct response: {"game_plan":"Goal: find the cheapest flight matching the human's constraints. Not yet defined which constraints matter.","thought":"The task doesn't say how many stops are acceptable, which changes what \\"cheapest\\" even means (a 1-stop flight is often much cheaper than nonstop). This isn't inferable from the page — better to ask than guess wrong.","action":{"type":"ask_user","question":"Is a flight with layovers okay, or do you need nonstop only?"}}`;
+Correct response: {"game_plan":"Goal: find the cheapest flight matching the human's constraints. Not yet defined which constraints matter.","thought":"The task doesn't say how many stops are acceptable, which changes what \\"cheapest\\" even means (a 1-stop flight is often much cheaper than nonstop). This isn't inferable from the page — better to ask than guess wrong.","action":{"type":"ask_user","question":"Is a flight with layovers okay, or do you need nonstop only?"}}
+
+EXAMPLE — Pattern F, bulk contact scrape:
+TASK: "copy every email address on this page into one comma-separated list"
+DATA BUFFER: 0 rows collected so far.
+Correct response: {"game_plan":"Goal: every email on the page copied to the clipboard as one comma-separated list. Done once extract has run and copy_clipboard has flushed the buffer.","thought":"This is a bulk-extraction task. Run extract with extract_mode=emails first; the result goes into the data buffer automatically.","action":{"type":"extract","extract_mode":"emails","reason":"Pull every email address on the current page into the data buffer."}}
+(Next step, once DATA BUFFER shows rows collected) Correct response: {"game_plan":"Goal: every email on the page copied to the clipboard as one comma-separated list. Done once extract has run and copy_clipboard has flushed the buffer.","thought":"Emails are already in the buffer. Flushing it to the clipboard now satisfies the task; nothing left to extract on this single page.","action":{"type":"copy_clipboard","format":"csv","reason":"Task said 'copy', so clipboard rather than a file download."}}
+(Final step) Correct response: {"game_plan":"Goal: every email on the page copied to the clipboard as one comma-separated list. Done once extract has run and copy_clipboard has flushed the buffer.","thought":"copy_clipboard already succeeded. Task complete.","action":{"type":"finish","reason":"Emails extracted and copied to clipboard."}}`;
 
 // ─── Routes ─────────────────────────────────────────────────────────────────
 
@@ -304,7 +395,7 @@ app.post('/api/plan', async (req, res) => {
   const {
     taskId, screenshot, task, history, elements, elementCount, domSnapshot,
     pageText, url, title, scrollY, scrollHeight, navigatedSinceStart, openTabs, overallPlan,
-    step, maxSteps, urlTrail,
+    step, maxSteps, urlTrail, dataBufferCount, dataBufferKind,
   } = req.body;
 
   console.log('Received plan request for task:', task);
@@ -313,6 +404,10 @@ app.post('/api/plan', async (req, res) => {
   if (!task)       return res.status(400).json({ error: 'task required' });
 
   const effectiveTaskId = taskId || 'default';
+
+  const bufferStatus = dataBufferCount
+    ? `${dataBufferCount} row(s) collected so far (kind: ${dataBufferKind || 'unknown'}). Keep extracting more pages if the task isn't fully covered yet, or export_data/copy_clipboard once you are done, then finish.`
+    : '0 rows collected so far.';
 
   const userText = `TASK: ${task}
 
@@ -332,6 +427,9 @@ ${openTabs || '(only one tab open)'}
 
 OVERALL PLAN (set at step 1 — repeat unchanged unless it was genuinely wrong):
 ${overallPlan || '(not yet set — this is step 1, define it now)'}
+
+DATA BUFFER (accumulated rows from 'extract' actions this task — ground truth, computed by code):
+${bufferStatus}
 
 INTERACTIVE ELEMENTS (match numbered labels in screenshot):
 ${elements || '(none)'}

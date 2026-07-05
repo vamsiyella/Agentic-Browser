@@ -32,6 +32,26 @@ const MAIN_FRAME = { frameId: 0 };
 // just "open a new tab" have nothing to click and don't need to.
 const ACTIONS_REQUIRING_ELEMENT = new Set(['click', 'type', 'select', 'hover']);
 
+// Bulk data/UI actions, routed through the content script's DATA_ACTION
+// message instead of EXECUTE_ACTION (see content/agent.js). These power
+// bulk extraction & copying (extract), infinite scroll (scroll_to_bottom),
+// accordion/FAQ expansion (expand_all), hi-res image discovery (find_images),
+// and batch checkbox selection for deletion workflows (check_matching).
+const DATA_ACTION_TYPES = new Set(['extract', 'expand_all', 'scroll_to_bottom', 'find_images', 'check_matching']);
+
+// Loop-level actions that don't touch the page DOM at all — they operate on
+// the accumulated data buffer or trigger browser-level downloads.
+const BUFFER_ACTION_TYPES = new Set(['export_data', 'copy_clipboard', 'download_asset', 'download_matching_images']);
+
+// Actions where repeating the same signature step-over-step is often
+// INTENTIONAL (e.g. "extract" on page 1, 2, 3... of a paginated scrape) —
+// exclude these from the same-action-streak "stuck loop" abort below.
+const REPEATABLE_ACTION_TYPES = new Set([
+  'scroll', 'wait', 'extract', 'expand_all', 'scroll_to_bottom',
+  'find_images', 'check_matching', 'export_data', 'copy_clipboard',
+  'download_asset', 'download_matching_images',
+]);
+
 export class AgentLoop {
   constructor(serverUrl, onUpdate) {
     this.client = new LLMClient(serverUrl);
@@ -60,6 +80,12 @@ export class AgentLoop {
     // This is what lets the model check itself against reality instead of
     // trusting its own (possibly stale/repeated) reasoning from a prior step.
     this.urlTrail = [];
+    // Accumulated rows from 'extract' actions across the whole task —
+    // this is what lets a paginated scrape (extract page 1, click Next,
+    // extract page 2, ...) build up one combined dataset before a single
+    // export_data/copy_clipboard flush at the end.
+    this.dataBuffer = [];
+    this.dataBufferKind = null;
   }
 
   stop() {
@@ -90,6 +116,23 @@ export class AgentLoop {
     }
   }
 
+  // Serializes the accumulated data buffer for export_data / copy_clipboard.
+  // CSV is the default (clean two-column lists, contact lists, tables, link
+  // harvests all read naturally as CSV); JSON is available for anything
+  // downstream that wants structure preserved.
+  _bufferToText(format) {
+    if (!this.dataBuffer.length) return '';
+    if (format === 'json') {
+      return JSON.stringify(this.dataBuffer, null, 2);
+    }
+    return this.dataBuffer
+      .map(row => row.map(cell => {
+        const s = String(cell ?? '');
+        return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+      }).join(','))
+      .join('\n');
+  }
+
   // ─── MAIN LOOP ────────────────────────────────────────────────────────────
 
   async run(task, tabId) {
@@ -106,6 +149,8 @@ export class AgentLoop {
     this.taskId = (crypto.randomUUID && crypto.randomUUID()) || `task-${Date.now()}`;
     this.overallPlan = null;
     this.urlTrail = [];
+    this.dataBuffer = [];
+    this.dataBufferKind = null;
 
     this._log('info', `Starting task: ${task}`);
 
@@ -176,6 +221,8 @@ export class AgentLoop {
             stepNumber: step + 1,
             maxSteps: MAX_STEPS,
             urlTrail: this.urlTrail,
+            dataBufferCount: this.dataBuffer.length,
+            dataBufferKind: this.dataBufferKind,
           });
 
           if (!this.overallPlan && plan.game_plan) {
@@ -213,14 +260,14 @@ export class AgentLoop {
         // ── DONE CHECK ───────────────────────────────────────────────────
         if (plan.action?.type === 'finish') {
           this._log('success', `Task Completed! Reason: ${plan.action.reason || 'Goal achieved.'}`);
-          this.onUpdate({ type: 'DONE', result: plan.action.reason || plan.thought });
+          this.onUpdate({ type: 'DONE', result: plan.action.reason || plan.thought, rowsCollected: this.dataBuffer.length });
           this.running = false;
           break;
         }
         if (plan.action?.type === 'done') {
           // Defensive fallback in case the model emits an alternate phrasing.
           this._log('success', `Done: ${plan.action?.result || plan.thought}`);
-          this.onUpdate({ type: 'DONE', result: plan.action?.result || plan.thought });
+          this.onUpdate({ type: 'DONE', result: plan.action?.result || plan.thought, rowsCollected: this.dataBuffer.length });
           return;
         }
 
@@ -262,7 +309,7 @@ export class AgentLoop {
           // ariaLabel/placeholder/name don't change when the value does.
           const targetLabel = targetEl
             ? (targetEl.ariaLabel || targetEl.placeholder || targetEl.name || targetEl.text || `${targetEl.tag} element`)
-            : (plan.action?.url || plan.action?.key || null);
+            : (plan.action?.url || plan.action?.key || plan.action?.extract_mode || plan.action?.keyword || null);
 
           const preScrollHeight = obs.pageContext.scrollHeight;
           // NOTE: this used to be called twice per step (a real bug — every
@@ -274,11 +321,49 @@ export class AgentLoop {
           // care about failures that are still happening back-to-back.
           this.sameFailureStreak = 0;
           this.lastFailedSignature = null;
+
+          // Merge any newly-extracted rows into the running buffer. This is
+          // what makes "extract page 1 → next → extract page 2 → ..." work:
+          // each extract call only reports THIS page's rows, and the loop
+          // (not the model) is responsible for accumulating them, so the
+          // model never has to re-state the whole dataset from memory.
+          let resultSummary = 'executed OK';
+          if (plan.action.type === 'extract' && execResult?.rows) {
+            this.dataBuffer.push(...execResult.rows);
+            this.dataBufferKind = execResult.kind;
+            resultSummary = `extracted ${execResult.rows.length} row(s) — buffer now has ${this.dataBuffer.length} total`;
+            this._log('success', resultSummary);
+          } else if (plan.action.type === 'expand_all') {
+            resultSummary = `expanded ${execResult?.clicked ?? 0} element(s) across ${execResult?.passes ?? 0} pass(es)`;
+            this._log('success', resultSummary);
+          } else if (plan.action.type === 'scroll_to_bottom') {
+            resultSummary = `scrolled to bottom ${execResult?.iterations ?? 0}x (final height ${execResult?.finalScrollHeight ?? '?'}px${execResult?.stoppedEarly ? ', stopped early — page stopped growing' : ''})`;
+            this._log('success', resultSummary);
+          } else if (plan.action.type === 'find_images') {
+            resultSummary = `found ${execResult?.images?.length ?? 0} image(s) matching the size/exclude filters`;
+            this._log('success', resultSummary);
+          } else if (plan.action.type === 'check_matching') {
+            resultSummary = `checked ${execResult?.checked ?? 0} of ${execResult?.inspected ?? 0} checkbox(es) matching "${plan.action.keyword}"`;
+            this._log('success', resultSummary);
+          } else if (plan.action.type === 'export_data') {
+            resultSummary = `exported ${execResult?.rows ?? this.dataBuffer.length} row(s) to a download`;
+            this._log('success', resultSummary);
+          } else if (plan.action.type === 'copy_clipboard') {
+            resultSummary = `copied ${execResult?.copied ?? 0} characters to the clipboard`;
+            this._log('success', resultSummary);
+          } else if (plan.action.type === 'download_asset') {
+            resultSummary = `download started (id ${execResult?.downloadId})`;
+            this._log('success', resultSummary);
+          } else if (plan.action.type === 'download_matching_images') {
+            resultSummary = `downloaded ${execResult?.downloaded ?? 0} of ${execResult?.attempted ?? 0} matching image(s)`;
+            this._log('success', resultSummary);
+          }
+
           this.history.push({
             action: plan.action,
             target_label: targetLabel, // e.g. "Next" — meaningful across steps, unlike element_id
             thought: plan.thought,
-            result: `executed OK`,
+            result: resultSummary,
             succeeded: true,
             url: obs.pageContext.url,
             // Ground truth for 'type' actions: what the field actually
@@ -292,7 +377,7 @@ export class AgentLoop {
             // above). Don't guess it here.
           });
 
-          const isExploratory = plan.action.type === 'scroll' || plan.action.type === 'wait';
+          const isExploratory = REPEATABLE_ACTION_TYPES.has(plan.action.type);
 
           if (plan.action.type === 'scroll') {
             const postScrollHeight = execResult?.scrollHeight || preScrollHeight;
@@ -322,6 +407,7 @@ export class AgentLoop {
             this.onUpdate({
               type: 'DONE',
               result: `Repeated "${signature}" ${this.sameActionStreak}x — ${likelyDone ? 'task likely already completed after the first execution.' : 'stopped before burning more steps/budget on a stuck loop. Check the last screenshot to see what\'s blocking progress.'}`,
+              rowsCollected: this.dataBuffer.length,
             });
             this.running = false;
             return;
@@ -489,6 +575,19 @@ export class AgentLoop {
     }
 
     try {
+      // ── Bulk data/UI actions: routed through the page (DATA_ACTION) ──────
+      if (DATA_ACTION_TYPES.has(action.type)) {
+        const r = await chrome.tabs.sendMessage(tabId, { type: 'DATA_ACTION', action }, MAIN_FRAME);
+        if (!r?.success) throw new Error(r?.error || 'Content script error');
+        return r.result || {};
+      }
+
+      // ── Buffer/download actions: handled entirely in the background,
+      //    no page interaction needed except re-deriving an image list. ──
+      if (BUFFER_ACTION_TYPES.has(action.type)) {
+        return await this._executeBufferAction(action);
+      }
+
       switch (action.type) {
         case 'navigate':
           await chrome.tabs.update(tabId, { url: action.url });
@@ -598,6 +697,74 @@ export class AgentLoop {
       // a fresh observe+plan cycle with a correct, current element map
       // instead of a stale guess.
       throw err;
+    }
+  }
+
+  // Handles export_data / copy_clipboard / download_asset /
+  // download_matching_images — none of these need the content script for
+  // the actual write/download, only (for download_matching_images) to
+  // re-scan the page for matching <img> src URLs first.
+  async _executeBufferAction(action) {
+    switch (action.type) {
+      case 'export_data': {
+        if (!this.dataBuffer.length) {
+          throw new Error('No extracted data to export yet — run one or more "extract" actions first.');
+        }
+        const format = action.format === 'json' ? 'json' : 'csv';
+        const text = this._bufferToText(format);
+        const filename = action.filename || `agentic-export-${Date.now()}.${format === 'json' ? 'json' : 'csv'}`;
+        const dataUrl = `data:text/plain;charset=utf-8,${encodeURIComponent(text)}`;
+        const downloadId = await chrome.downloads.download({ url: dataUrl, filename, saveAs: false });
+        return { downloadId, rows: this.dataBuffer.length, filename };
+      }
+
+      case 'copy_clipboard': {
+        const text = action.text || this._bufferToText(action.format === 'json' ? 'json' : 'csv');
+        if (!text) throw new Error('Nothing to copy — no explicit text given and the data buffer is empty.');
+        const r = await chrome.tabs.sendMessage(this.tabId, { type: 'COPY_TO_CLIPBOARD', text }, MAIN_FRAME);
+        if (!r?.success) throw new Error(r?.error || 'Clipboard write failed.');
+        return { copied: text.length };
+      }
+
+      case 'download_asset': {
+        if (!action.url) throw new Error('download_asset requires a "url".');
+        const downloadId = await chrome.downloads.download({
+          url: action.url,
+          filename: action.filename || undefined,
+          saveAs: false,
+        });
+        return { downloadId };
+      }
+
+      case 'download_matching_images': {
+        const r = await chrome.tabs.sendMessage(this.tabId, {
+          type: 'DATA_ACTION',
+          action: {
+            type: 'find_images',
+            min_width: action.min_width,
+            min_height: action.min_height,
+            exclude_hints: action.exclude_hints,
+          },
+        }, MAIN_FRAME);
+        if (!r?.success) throw new Error(r?.error || 'Content script error while scanning for images.');
+        const images = r.result?.images || [];
+        if (!images.length) throw new Error('No images on this page matched the given size/exclude filters.');
+
+        let downloaded = 0;
+        for (const img of images) {
+          try {
+            await chrome.downloads.download({ url: img.src, saveAs: false });
+            downloaded++;
+            await sleep(200); // don't hammer the downloads API
+          } catch (e) {
+            this._log('warn', `Failed to download ${img.src}: ${e.message}`);
+          }
+        }
+        return { downloaded, attempted: images.length };
+      }
+
+      default:
+        throw new Error(`Unknown buffer action: ${action.type}`);
     }
   }
 

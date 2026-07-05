@@ -1,15 +1,16 @@
 {
   "manifest_version": 3,
   "name": "Agentic Browser",
-  "version": "0.1.0",
-  "description": "Autonomous AI web agent — observes pages, plans actions, executes tasks",
+  "version": "0.2.0",
+  "description": "Autonomous AI web agent — observes pages, plans actions, executes tasks, and does bulk extraction/downloads",
   "permissions": [
     "activeTab",
     "scripting",
     "storage",
     "tabs",
     "sidePanel",
-    "webNavigation"
+    "webNavigation",
+    "downloads"
   ],
   "host_permissions": ["<all_urls>"],
   "background": {
@@ -21,7 +22,7 @@
       "matches": ["<all_urls>"],
       "js": ["content/agent.js"],
       "run_at": "document_idle",
-      "all_frames": true 
+      "all_frames": true
     }
   ],
   "side_panel": {
